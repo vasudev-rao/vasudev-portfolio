@@ -1,0 +1,74 @@
+[
+  {
+    "id": "realtime-streaming-pipeline",
+    "title": "Real-Time Event Streaming Pipeline",
+    "description": "Kafka → Spark Structured Streaming pipeline with late-event handling, deduplication, and exactly-once writes to Delta Lake. Reduced end-to-end data latency from minutes to under 5 seconds at 10M+ events/day.",
+    "longDescription": "Problem: Batch ingestion introduced 15–30 min data lag unacceptable for real-time analytics and ML feature freshness. Constraints: exactly-once delivery, schema evolution without downtime, sub-5s end-to-end latency, auto-scaling under traffic spikes. Decisions: Kafka consumers with manual offset commit after idempotent Delta writes; watermark-based late-event handling with configurable tolerance windows; Confluent Schema Registry for forward-compatible schema evolution; consumer group auto-scaling on EMR using CloudWatch lag metrics. Outcome: 10M+ events/day processed at <5s latency with zero data loss under a 3× traffic spike in load testing.",
+    "tags": ["Apache Kafka", "Spark Structured Streaming", "Delta Lake", "AWS EMR", "Python"],
+    "github": "https://github.com",
+    "demo": null,
+    "image": "https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=600&q=80",
+    "featured": true,
+    "year": 2024
+  },
+  {
+    "id": "enterprise-lakehouse-databricks",
+    "title": "Enterprise Lakehouse on Databricks",
+    "description": "Replaced a fragmented multi-warehouse topology (50+ siloed ingestion jobs) with a unified Delta Lake medallion architecture on Databricks. Cut pipeline execution time by 60% and eliminated cross-team schema inconsistencies.",
+    "longDescription": "Problem: 50+ isolated ingestion jobs wrote to separate Redshift clusters with no shared contracts, causing frequent downstream breakage and duplicated compute. Constraints: zero-downtime migration, schema contract enforcement across 8 teams, and cost reduction without degrading query SLAs. Decisions: medallion architecture (bronze/silver/gold) with dbt-managed transformations at the silver boundary; data contracts enforced via Great Expectations checks at ingestion; Z-ordering on high-cardinality join keys; Photon-enabled compute for aggregation-heavy gold layer. Governance enforced via Unity Catalog with column-level lineage. Outcome: 60% reduction in pipeline runtime, eliminated cross-team schema breakage, and consolidated compute reduced Databricks DBU spend by 35%.",
+    "tags": ["Databricks", "Delta Lake", "PySpark", "Unity Catalog", "dbt", "Terraform"],
+    "github": "https://github.com",
+    "demo": null,
+    "image": "https://images.unsplash.com/photo-1551288049-bebda4e38f71?w=600&q=80",
+    "featured": true,
+    "year": 2024
+  },
+  {
+    "id": "snowflake-bigquery-modernization",
+    "title": "Warehouse Modernization — Snowflake & BigQuery",
+    "description": "Migrated 100+ TB from on-premise and legacy cloud warehouses to Snowflake and BigQuery using a dual-write validation strategy. Achieved 70% query performance improvement through physical data modeling and incremental ELT redesign.",
+    "longDescription": "Problem: Legacy Redshift and Oracle tables ran full-table scans with T+1 refresh cycles, causing missed SLAs and slow analyst workflows. Constraints: 100+ TB migration with zero data loss, zero downtime cutover, and query performance parity before decommissioning source systems. Decisions: Snowflake micro-partition clustering on query-critical dimensions; BigQuery date-partitioned fact tables with search optimization; dbt incremental models with row-level deduplication at load; 12-week dual-write validation comparing row counts and aggregates between systems before cutover. Outcome: BigQuery 90-day scan p95 dropped from 42s to 11s; Snowflake query costs reduced 40% vs Redshift through clustering elimination of unnecessary partition scans.",
+    "tags": ["Snowflake", "BigQuery", "dbt", "Airflow", "Python"],
+    "github": "https://github.com",
+    "demo": null,
+    "image": "https://images.unsplash.com/photo-1544197150-b99a580bb7a8?w=600&q=80",
+    "featured": true,
+    "year": 2023
+  },
+  {
+    "id": "mlops-feature-store",
+    "title": "ML Feature Store",
+    "description": "Centralized dual-mode feature platform serving 1,000+ features with point-in-time correctness for offline training and sub-10ms retrieval for online inference. Eliminated training-serving skew across 4 ML teams.",
+    "longDescription": "Problem: Feature computation fragmented across notebooks caused training-serving skew and repeated engineering work across teams. Constraints: point-in-time correctness for training datasets (no label leakage), sub-10ms online serving latency, and full feature lineage for model auditing. Decisions: Databricks Feature Store for offline serving backed by Delta Lake time-travel; Redis for online lookups with a write-through pipeline on each batch update; Airflow DAGs with dependency-aware scheduling for automated feature refresh; MLflow tracking linking feature versions to model versions for end-to-end traceability. Outcome: Eliminated training-serving skew across 4 ML teams; online feature serving at p99 <8ms; feature reuse across teams reduced duplicate computation by ~50%.",
+    "tags": ["Databricks Feature Store", "MLflow", "PySpark", "Delta Lake", "Redis", "FastAPI"],
+    "github": "https://github.com",
+    "demo": null,
+    "image": "https://images.unsplash.com/photo-1460925895917-afdab827c52f?w=600&q=80",
+    "featured": false,
+    "year": 2024
+  },
+  {
+    "id": "fintech-credit-risk-pipeline",
+    "title": "Fintech Credit Risk Pipeline",
+    "description": "Real-time credit decisioning system replacing overnight batch scoring. Kafka-driven feature engineering reduced decision latency from 48 hours to under 2 minutes while maintaining 95%+ model accuracy at 100K+ applications/day.",
+    "longDescription": "Problem: Legacy overnight batch scoring created a 24–48 hour credit decision window incompatible with digital lending UX requirements. Constraints: sub-2min decision latency, 95%+ model accuracy at 4× previous throughput, and strict data contracts to prevent silent feature drift in production. Decisions: Kafka consumer pipeline enriching applicant events with bureau signals, behavioral history, and account features in real time; FastAPI scoring service with challenger/champion model routing backed by MLflow model registry; strict schema contracts between feature pipeline and scoring service enforced at deployment; PostgreSQL as the audit and decision-log store with partitioned retention. Outcome: Decision latency reduced from 48h to <2min; system sustained 100K+ applications/day at 95%+ accuracy; zero feature-drift incidents post-launch.",
+    "tags": ["PySpark", "Kafka", "PostgreSQL", "FastAPI", "AWS Lambda", "MLflow"],
+    "github": "https://github.com",
+    "demo": null,
+    "image": "https://images.unsplash.com/photo-1518186285589-2f7649de83e0?w=600&q=80",
+    "featured": false,
+    "year": 2023
+  },
+  {
+    "id": "cloud-cost-optimization",
+    "title": "Data Platform Cost Governance Framework",
+    "description": "Automated framework for detecting runaway Spark clusters, enforcing storage tiering, and rightsizing compute across 20+ Databricks workspaces. Reduced combined AWS and GCP data platform spend by 40% within 90 days.",
+    "longDescription": "Problem: Uncontrolled cluster autoscaling and unpartitioned S3 data caused monthly cloud costs to grow 3× over 18 months with no visibility into per-workload spend attribution. Constraints: governance across 20+ workspaces and GCP projects with no centralized billing view; enforcement must be automatic, not dependent on manual review. Decisions: ingested AWS Cost Explorer and GCP Billing APIs into BigQuery; isolation forest anomaly detection on spend-per-DBU to flag outlier workloads; Terraform-driven enforcement — idle cluster termination after configurable thresholds, S3 Intelligent-Tiering on cold prefixes, and oversized driver node downsizing; Slack alerts for policy violations with auto-remediation audit trail. Outcome: 40% reduction in monthly platform spend within 90 days; cost attribution per team enabled internal chargeback model.",
+    "tags": ["Python", "Terraform", "AWS Cost Explorer", "BigQuery", "CloudWatch", "Databricks API"],
+    "github": "https://github.com",
+    "demo": null,
+    "image": "https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=600&q=80",
+    "featured": false,
+    "year": 2023
+  }
+]

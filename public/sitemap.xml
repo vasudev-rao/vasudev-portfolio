@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://vasudevarao.com/</loc><lastmod>2026-03-03</lastmod><changefreq>monthly</changefreq><priority>1.0</priority></url>
+  <url><loc>https://vasudevarao.com/about</loc><lastmod>2026-03-03</lastmod><changefreq>monthly</changefreq><priority>0.8</priority></url>
+  <url><loc>https://vasudevarao.com/projects</loc><lastmod>2026-03-03</lastmod><changefreq>monthly</changefreq><priority>0.8</priority></url>
+  <url><loc>https://vasudevarao.com/blog</loc><lastmod>2026-03-03</lastmod><changefreq>weekly</changefreq><priority>0.9</priority></url>
+  <url><loc>https://vasudevarao.com/contact</loc><lastmod>2026-03-03</lastmod><changefreq>yearly</changefreq><priority>0.6</priority></url>
+  <url><loc>https://vasudevarao.com/blog/build-lakehouse-delta-lake-databricks</loc><lastmod>2026-03-03</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>
+  <url><loc>https://vasudevarao.com/blog/data-engineering-system-design-real-time</loc><lastmod>2026-03-03</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>
+  <url><loc>https://vasudevarao.com/blog/dbt-best-practices-at-scale</loc><lastmod>2026-03-03</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>
+  <url><loc>https://vasudevarao.com/blog/how-llms-will-transform-data-engineering</loc><lastmod>2026-03-03</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>
+  <url><loc>https://vasudevarao.com/blog/kafka-streaming-pipelines-production</loc><lastmod>2026-03-03</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>
+  <url><loc>https://vasudevarao.com/blog/migrating-redshift-to-apache-iceberg</loc><lastmod>2026-03-03</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>
+  <url><loc>https://vasudevarao.com/blog/modern-data-pipelines-pyspark-best-practices</loc><lastmod>2026-03-03</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>
+  <url><loc>https://vasudevarao.com/blog/snowflake-vs-bigquery-vs-databricks</loc><lastmod>2026-03-03</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>
+</urlset>

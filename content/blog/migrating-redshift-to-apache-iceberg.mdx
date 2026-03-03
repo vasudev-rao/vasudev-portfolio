@@ -1,0 +1,101 @@
+---
+title: "Migrating from Redshift to Apache Iceberg: What We Learned"
+description: "A detailed account of migrating a 50TB Redshift warehouse to an open lakehouse on Apache Iceberg + S3, saving $400K/year and improving query performance 3x."
+date: "2024-06-05"
+tags: ["Apache Iceberg", "Lakehouse", "AWS", "Data Architecture"]
+---
+
+We migrated a 50TB Redshift warehouse to an Apache Iceberg lakehouse on S3. Here's the honest story — what worked, what didn't, and what we'd do differently.
+
+## Why We Migrated
+
+The business case was clear: Redshift was costing $85K/month. The technical case was compelling: we were hitting sort key limitations, vacuum times were growing, and cross-team data sharing required expensive Redshift data shares.
+
+Apache Iceberg offered open table format (no vendor lock-in), hidden partitioning, schema evolution, time-travel, and storage decoupled from compute — all things Redshift couldn't match.
+
+## The Architecture
+
+Our target architecture:
+
+- **Storage**: S3 (Parquet files managed by Iceberg)
+- **Catalog**: AWS Glue Data Catalog (Iceberg-native metadata)
+- **Compute (batch)**: AWS EMR with Spark
+- **Compute (interactive)**: Amazon Athena v3 (native Iceberg support)
+- **Orchestration**: Apache Airflow on EKS
+- **Transformation**: dbt with the `dbt-spark` adapter
+
+Iceberg's table format manages file manifests, partition specs, and snapshots entirely in S3. Glue Catalog stores table metadata. Any engine that speaks Iceberg (Spark, Athena, Trino, Flink) can read/write the same tables.
+
+## Migration Strategy: Dual-Write
+
+We used a dual-write strategy to migrate with zero downtime:
+
+1. **Shadow tables** — created Iceberg equivalents for each Redshift table
+2. **Dual-write pipelines** — all new data written to Redshift AND Iceberg in parallel
+3. **Backfill** — migrated historical data in partitioned chunks (30-day windows)
+4. **Validation** — compared row counts and aggregates between systems for 2 weeks
+5. **Cutover** — redirected BI tools to Athena/Trino queries, shut down Redshift writes
+6. **Decommission** — final Redshift shutdown after 30-day rollback window
+
+The dual-write phase ran for 6 weeks total. This was longer than planned — schema inconsistencies between Redshift and Iceberg types required careful mapping (especially `DECIMAL` precision and `TIMESTAMP` timezone handling).
+
+## Iceberg Features That Changed How We Work
+
+**Hidden partitioning** is transformative. In Redshift, analysts had to remember `WHERE event_date = ...` to avoid full scans. In Iceberg, you define the partition spec once on the table, and the engine automatically prunes — analysts never think about it.
+
+```sql
+-- Partition spec defined once at table creation
+CREATE TABLE events (
+  event_id    BIGINT,
+  user_id     BIGINT,
+  event_type  STRING,
+  event_ts    TIMESTAMP,
+  properties  MAP<STRING, STRING>
+)
+PARTITIONED BY (days(event_ts), bucket(16, user_id))
+```
+
+**Schema evolution** with no rewrites. Adding a nullable column in Redshift requires an ALTER TABLE that locks large tables. In Iceberg, column additions are instant metadata-only operations.
+
+**Time travel** has become a production debugging tool. When an analyst reports "the numbers changed overnight", we can query the table as-of any snapshot:
+
+```sql
+-- As-of timestamp
+SELECT * FROM events
+FOR SYSTEM_TIME AS OF TIMESTAMP '2024-06-01 00:00:00'
+
+-- As-of snapshot ID
+SELECT * FROM events
+FOR SYSTEM_VERSION AS OF 5432198765
+```
+
+## Performance Results
+
+After tuning, query performance improved significantly:
+
+| Query Type | Redshift | Iceberg (Athena) | Improvement |
+|---|---|---|---|
+| Single-day event scan | 8.2s | 1.4s | 5.8x |
+| 90-day aggregation | 42s | 11s | 3.8x |
+| Cross-table join (large) | 95s | 28s | 3.4x |
+| Point lookup by user_id | 3.1s | 0.9s | 3.4x |
+
+Key tuning decisions: Z-ordering by `user_id` + `event_type`, `target_file_size_bytes = 256MB`, Snappy compression, and regular `OPTIMIZE` + `EXPIRE_SNAPSHOTS` maintenance jobs.
+
+## Cost Results
+
+Monthly compute + storage cost went from **$85K** (Redshift) to **$18K** (S3 + EMR + Athena). The $67K/month ($800K/year) saving came from:
+
+- S3 storage at ~$0.02/GB vs Redshift's ~$0.25/GB managed storage
+- Athena pay-per-query with aggressive data pruning
+- EMR Spot instances for Spark batch jobs (70% discount vs On-Demand)
+
+## What We'd Do Differently
+
+**Catalog choice matters more than we thought.** Glue Catalog is convenient on AWS but has limitations: no multi-region replication, API rate limits at scale, and vendor lock-in. Next time we'd evaluate Project Nessie or Apache Polaris for catalog portability.
+
+**Compaction strategy upfront.** Small file accumulation is Iceberg's #1 operational problem. We retrofitted compaction jobs after launch. Plan your `OPTIMIZE` maintenance schedule before go-live.
+
+**Test Trino vs Athena.** We went all-in on Athena but later found Trino on EMR Serverless was cheaper for long-running analytical queries. Benchmark your actual query patterns before committing.
+
+Overall: the migration was worth it. Lower cost, better performance, and the open table format gives us engine flexibility we didn't have with Redshift.

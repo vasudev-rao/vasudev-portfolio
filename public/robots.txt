@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://vasudevarao.com/sitemap.xml
+Host: https://vasudevarao.com
