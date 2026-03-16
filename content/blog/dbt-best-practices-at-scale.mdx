@@ -1,0 +1,121 @@
+---
+title: "dbt Best Practices for Large-Scale Analytics Projects"
+description: "Hard-won lessons from managing 800+ dbt models across 6 domains — structuring models, data contracts, CI/CD, and performance tuning."
+date: "2024-07-18"
+tags: ["dbt", "Analytics Engineering", "Snowflake", "Data Quality"]
+---
+
+Running dbt at scale is a different beast from the getting-started tutorials. After managing 800+ models across 6 business domains at a Series B company, here are the patterns that actually matter.
+
+## Model Layering: Beyond the Basics
+
+The classic staging → intermediate → mart pattern is a good start, but at scale you need more structure.
+
+The layering I've converged on:
+
+- `stg_` — 1:1 source-aligned, type casting, renaming only. No business logic.
+- `int_` — Cross-source joins, entity resolution, denormalization. Intermediate outputs other models depend on.
+- `fct_` — Append-only fact tables in long format. Optimized for aggregation.
+- `dim_` — Slowly-changing dimensions, conformed for reuse across domains.
+- `rpt_` — Pre-aggregated reporting tables built for specific BI tools or dashboards.
+
+The `rpt_` layer is underrated. Building BI-optimized aggregates in dbt (rather than in Looker/Tableau) dramatically improves dashboard performance and testability.
+
+## Data Contracts with `dbt-contracts`
+
+In multi-team environments, models break because of unannounced upstream changes. Data contracts enforce explicit agreements between producers and consumers.
+
+Declare a contract on any model consumed by other teams:
+
+```yaml
+# models/finance/fct_revenue.yml
+models:
+  - name: fct_revenue
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: revenue_id
+        data_type: varchar
+        constraints:
+          - type: not_null
+          - type: unique
+      - name: amount_usd
+        data_type: numeric
+        constraints:
+          - type: not_null
+```
+
+dbt will fail compilation — not just tests — if the schema drifts. This catches breaking changes before they hit production.
+
+## Incremental Strategies at Scale
+
+Full refreshes on large tables are the #1 performance killer. Every model over 10M rows should be incremental.
+
+The strategy depends on your source data pattern:
+
+**`append_only`** — For immutable event tables. Fastest.
+
+**`merge` with `unique_key`** — For upsertable records. Use with care on Snowflake — merges are expensive. Batch into micro-windows.
+
+**`insert_overwrite` with date partitions** — Best for Snowflake/BigQuery when you're replacing full day/hour partitions. Much cheaper than row-level merges.
+
+```sql
+{{
+  config(
+    materialized='incremental',
+    incremental_strategy='insert_overwrite',
+    partition_by={
+      "field": "event_date",
+      "data_type": "date",
+      "granularity": "day"
+    },
+    cluster_by=["user_id", "event_type"]
+  )
+}}
+
+select * from {{ ref('stg_events') }}
+{% if is_incremental() %}
+  where event_date >= dateadd('day', -3, current_date())
+{% endif %}
+```
+
+The `-3 day` lookback handles late-arriving data and reprocessing windows.
+
+## CI/CD: Slim CI and State-Based Runs
+
+Running all 800 models on every PR takes 45 minutes and kills developer velocity. Use dbt's `--select state:modified+` to only run changed models and their downstream dependents.
+
+```yaml
+# .github/workflows/dbt_ci.yml
+- name: Run modified models + downstream
+  run: |
+    dbt run \
+      --select state:modified+ \
+      --defer \
+      --state ./prod-artifacts \
+      --target ci
+    dbt test \
+      --select state:modified+ \
+      --defer \
+      --state ./prod-artifacts
+```
+
+`--defer` makes CI models reference prod for unchanged upstream deps — no need to rebuild the entire DAG. This cuts CI from 45 minutes to under 5.
+
+## Testing Pyramid
+
+Don't test everything equally. Apply tests proportional to impact:
+
+- **Every column** in `stg_` models: `not_null` + `unique` on PKs
+- **Every FK relationship**: `relationships` test across entity boundaries
+- **Business-critical KPIs**: Custom singular tests asserting known invariants (e.g., "daily revenue should never be negative")
+- **Statistical anomaly detection**: `dbt_utils.expression_is_true` or Great Expectations for drift detection
+
+The test suite should be fast enough to run on every PR. Drop low-signal tests if CI exceeds 10 minutes.
+
+## Closing Thoughts
+
+At scale, dbt is as much about team coordination as SQL. Invest in conventions early — model naming, layering, testing standards, and data contracts. The technical debt from inconsistent patterns compounds faster than in application code because everyone queries the same models.
+
+Document your `sources.yml` religiously. Future-you (and your colleagues) will thank you.

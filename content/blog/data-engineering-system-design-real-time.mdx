@@ -1,0 +1,217 @@
+---
+title: "Data Engineering System Design for Real-Time Applications"
+description: "Master the art of designing scalable real-time data systems. Learn architectural patterns, technology choices, and best practices for building high-throughput, low-latency data pipelines."
+date: "2026-01-20"
+tags: ["System Design", "Real-time", "Streaming"]
+---
+
+Real-time data systems fail in ways that batch systems do not. They fail silently. Data arrives late, events arrive out of order, consumers fall behind producers, and the system continues running while serving stale or incorrect results. Designing for correctness under these conditions is harder than it looks.
+
+This is a system design guide for engineers building high-throughput, low-latency data pipelines in production.
+
+## Defining "Real-Time"
+
+Before designing, be precise about requirements. "Real-time" spans several orders of magnitude:
+
+| Tier | Latency | Typical use case |
+|---|---|---|
+| Hard real-time | < 1ms | Autonomous vehicle control, trading execution |
+| Soft real-time | 1ms – 100ms | Fraud detection, recommendation serving |
+| Near real-time | 100ms – 10s | Operational dashboards, alerting |
+| Micro-batch | 10s – 5min | Streaming analytics, feature pipelines |
+
+Most "real-time" data engineering work targets near real-time or micro-batch. Know which tier you're in — it determines your technology choices and how much complexity is justified.
+
+## Core Architectural Components
+
+A production real-time data system has five layers:
+
+```
+Producers → Message Broker → Stream Processor → Serving Layer → Consumers
+                ↓
+          Dead Letter Queue
+```
+
+### 1. Message Broker (Kafka)
+
+Apache Kafka is the default choice for high-throughput event streaming. Key design decisions:
+
+**Topic partitioning:**
+Partitions determine parallelism. Partition by the natural unit of ordering — typically entity ID (user_id, order_id). This ensures events for the same entity arrive at the same partition in order.
+
+```python
+# Producer: explicit partitioning by entity
+from confluent_kafka import Producer
+
+producer = Producer({
+    "bootstrap.servers": "kafka:9092",
+    "acks": "all",                    # Wait for all in-sync replicas
+    "enable.idempotence": True,       # Exactly-once producer semantics
+    "compression.type": "lz4",        # Compress for throughput
+    "batch.size": 65536,              # 64KB batch — balance latency vs throughput
+    "linger.ms": 5,                   # Wait up to 5ms for more records to batch
+})
+
+producer.produce(
+    topic="order-events",
+    key=str(order_id).encode(),        # Partition key — same order_id → same partition
+    value=event_payload.encode(),
+    on_delivery=delivery_callback
+)
+```
+
+**Replication factor:** Use RF=3 for production. Never RF=1.
+
+**Retention:** Set retention by bytes, not time, for predictable storage costs. For high-throughput topics: `retention.bytes=10737418240` (10GB per partition).
+
+**Consumer group lag:** The single most important metric. Alert when lag exceeds your acceptable latency headroom.
+
+### 2. Stream Processor (Spark Structured Streaming)
+
+For stateful processing, Spark Structured Streaming with Delta Lake checkpointing provides exactly-once semantics end-to-end.
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, window, count, from_json
+from pyspark.sql.types import StructType, StringType, TimestampType, LongType
+
+spark = SparkSession.builder \
+    .config("spark.sql.streaming.checkpointLocation", "s3://checkpoints/order-agg/") \
+    .getOrCreate()
+
+# Schema enforcement at the consumer — fail fast on schema violations
+event_schema = StructType() \
+    .add("order_id", StringType()) \
+    .add("user_id", StringType()) \
+    .add("amount", LongType()) \
+    .add("event_time", TimestampType())
+
+raw_stream = spark.readStream \
+    .format("kafka") \
+    .option("kafka.bootstrap.servers", "kafka:9092") \
+    .option("subscribe", "order-events") \
+    .option("startingOffsets", "latest") \
+    .option("failOnDataLoss", "false") \
+    .load()
+
+parsed = raw_stream \
+    .select(from_json(col("value").cast("string"), event_schema).alias("data")) \
+    .select("data.*")
+
+# Windowed aggregation with watermark for late event tolerance
+aggregated = parsed \
+    .withWatermark("event_time", "10 minutes") \
+    .groupBy(
+        window(col("event_time"), "5 minutes", "1 minute"),
+        col("user_id")
+    ) \
+    .agg(count("order_id").alias("order_count"))
+
+query = aggregated.writeStream \
+    .format("delta") \
+    .outputMode("append") \
+    .trigger(processingTime="30 seconds") \
+    .option("checkpointLocation", "s3://checkpoints/order-agg/") \
+    .start("s3://silver/order-aggregates/")
+```
+
+**Critical: watermark configuration.** The watermark defines how long the system waits for late events before closing a window. Too tight → you drop data. Too loose → state grows unbounded and memory pressure increases. Measure your actual late-arrival distribution from your Kafka topic lag patterns before setting this value.
+
+### 3. Handling Late Events and Out-of-Order Data
+
+Out-of-order data is not an edge case — it is the default in distributed systems. Network latency, producer retries, and clock skew guarantee events will arrive out of order.
+
+Strategies:
+
+**Event time vs. processing time**: Always use event time (the timestamp when the event actually occurred) for windowing, never processing time (when Kafka received it). This requires reliable timestamps in your event payload.
+
+**Idempotent writes**: Design your sink to handle duplicate writes. Delta Lake `MERGE` with a deduplication key is the standard pattern:
+
+```python
+def write_with_dedup(micro_batch_df, batch_id):
+    from delta import DeltaTable
+    
+    if DeltaTable.isDeltaTable(spark, target_path):
+        target = DeltaTable.forPath(spark, target_path)
+        target.alias("t").merge(
+            micro_batch_df.alias("s"),
+            "t.order_id = s.order_id AND t.event_time = s.event_time"
+        ) \
+        .whenNotMatchedInsertAll() \
+        .execute()
+    else:
+        micro_batch_df.write.format("delta").save(target_path)
+
+stream.writeStream \
+    .foreachBatch(write_with_dedup) \
+    .start()
+```
+
+### 4. Dead Letter Queue
+
+Every stream processing system needs a DLQ. When events fail parsing, schema validation, or downstream writes, they must be captured for investigation — not silently dropped.
+
+```python
+def process_with_dlq(micro_batch_df, batch_id):
+    try:
+        valid = micro_batch_df.filter(col("order_id").isNotNull())
+        invalid = micro_batch_df.filter(col("order_id").isNull()) \
+            .withColumn("failure_reason", lit("null order_id")) \
+            .withColumn("batch_id", lit(batch_id))
+        
+        # Write valid records to target
+        valid.write.format("delta").mode("append").save(target_path)
+        
+        # Write invalid records to DLQ
+        invalid.write.format("delta").mode("append").save(dlq_path)
+        
+    except Exception as e:
+        # If the whole batch fails, write everything to DLQ
+        micro_batch_df \
+            .withColumn("failure_reason", lit(str(e))) \
+            .write.format("delta").mode("append").save(dlq_path)
+```
+
+## Scaling and Backpressure
+
+The defining failure mode of real-time systems: producers outpace consumers, lag grows, and the system degrades or crashes.
+
+**Backpressure mechanisms:**
+- Kafka consumer `max.poll.records`: limits records per poll to prevent OOM
+- Spark `maxOffsetsPerTrigger`: caps records processed per micro-batch
+- Consumer group autoscaling: add consumers (up to partition count) when lag exceeds threshold
+
+```python
+stream = spark.readStream \
+    .format("kafka") \
+    .option("maxOffsetsPerTrigger", 50000) \  # Cap per micro-batch
+    .load()
+```
+
+**Scaling rule:** You cannot have more consumers than partitions in a topic. Plan partition count for your maximum expected parallelism, not current load. Increasing partitions after data is written is non-trivial — it changes the partition assignments for existing keys.
+
+## Monitoring: What Actually Matters
+
+Instrument these, in order of importance:
+
+1. **Consumer group lag** (per topic, per partition): the primary health signal
+2. **End-to-end latency**: time from event creation to availability in serving layer
+3. **DLQ growth rate**: increasing DLQ records signals upstream schema changes or data quality issues
+4. **Processing throughput** (records/second): baseline for anomaly detection
+5. **Checkpoint duration**: slow checkpointing delays recovery time after failure
+
+```python
+# Custom metrics via Spark listener
+from pyspark.sql.streaming import StreamingQueryListener
+
+class LatencyMonitor(StreamingQueryListener):
+    def onQueryProgress(self, event):
+        progress = event.progress
+        lag_ms = progress.durationMs.get("triggerExecution", 0)
+        records_in = progress.numInputRows
+        # Emit to your metrics system (DataDog, Prometheus, CloudWatch)
+        metrics.gauge("streaming.lag_ms", lag_ms)
+        metrics.gauge("streaming.records_per_second", progress.inputRowsPerSecond)
+```
+
+Real-time systems do not fail catastrophically — they degrade gradually. A monitoring setup that catches lag growth at 2× before it reaches 10× is the difference between a routine investigation and a 2am incident.

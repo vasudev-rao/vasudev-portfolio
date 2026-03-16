@@ -1,0 +1,160 @@
+---
+title: "Building Reliable Kafka Streaming Pipelines in Production"
+description: "Everything I've learned running Kafka at 5M+ events/day — partitioning strategy, consumer group design, exactly-once semantics, and monitoring."
+date: "2024-04-22"
+tags: ["Kafka", "Streaming", "Data Engineering", "Real-Time"]
+---
+
+Kafka tutorials make streaming look easy. Production Kafka teaches you humility. Here's what running 5M+ events/day taught me about building reliable streaming pipelines.
+
+## Partitioning Strategy: Get This Right Upfront
+
+Partitioning is the most consequential architectural decision in Kafka and the hardest to change. Partitions determine parallelism, ordering guarantees, and consumer throughput.
+
+**Rule 1: Partition by the entity that needs ordered processing.** For user event streams, partition by `user_id`. This guarantees all events for a given user are processed in order by a single consumer. For payment events, partition by `payment_id` or `account_id`.
+
+**Rule 2: Partition count = planned peak consumers × 2.** You can't reduce partition count without recreating topics. Start higher than you need — idle partitions cost almost nothing.
+
+**Rule 3: Avoid hot partitions.** If your key space is skewed (some users generate 1000x more events), use a compound key like `user_id + date_bucket`, or implement a custom partitioner that caps per-key load.
+
+```python
+class BalancedPartitioner:
+    """Distributes hot keys across multiple partitions."""
+    
+    def partition(self, key: str, num_partitions: int) -> int:
+        base_partition = hash(key) % num_partitions
+        # Hot keys get spread across a sub-range of partitions
+        if self._is_hot_key(key):
+            bucket = random.randint(0, 3)
+            return (base_partition + bucket) % num_partitions
+        return base_partition
+```
+
+## Producer Configuration for Reliability
+
+Default producer settings optimize for throughput, not reliability. For financial or business-critical events, tune these:
+
+```python
+producer = KafkaProducer(
+    bootstrap_servers=BROKERS,
+    acks='all',                    # Wait for all in-sync replicas
+    retries=10,
+    retry_backoff_ms=300,
+    enable_idempotence=True,       # Exactly-once at producer level
+    max_in_flight_requests_per_connection=5,  # Required for idempotence
+    compression_type='snappy',
+    batch_size=65536,              # 64KB batches
+    linger_ms=5,                   # 5ms window to batch messages
+)
+```
+
+`acks='all'` + `enable_idempotence=True` gives you at-least-once delivery with deduplication at the broker level. This is the minimum for production data pipelines.
+
+## Consumer Group Design
+
+Consumer group management is where most streaming bugs live.
+
+**One consumer group per distinct use case.** Don't share consumer groups between your real-time dashboard consumer and your data warehouse sink. They have different SLAs and you don't want lag from one to affect the other.
+
+**Commit offsets after processing, not before.** The default `enable_auto_commit=True` commits offsets periodically regardless of processing success. If your consumer crashes between commit and processing, you lose messages.
+
+```python
+consumer = KafkaConsumer(
+    TOPIC,
+    bootstrap_servers=BROKERS,
+    group_id='warehouse-sink-v2',
+    enable_auto_commit=False,       # Manual commits only
+    auto_offset_reset='earliest',
+    max_poll_records=500,
+    max_poll_interval_ms=300000,    # 5 min processing window
+)
+
+for batch in consumer:
+    try:
+        process_batch(batch)
+        consumer.commit()           # Only commit after successful processing
+    except Exception as e:
+        # Dead letter queue for failed messages
+        send_to_dlq(batch, error=e)
+        consumer.commit()           # Commit even on DLQ to avoid infinite retry
+```
+
+## Exactly-Once with Kafka Transactions
+
+For pipelines that consume from Kafka, transform, and produce back to Kafka (e.g., Kafka → Flink → Kafka), you can achieve exactly-once semantics with transactions:
+
+```python
+producer = KafkaProducer(
+    transactional_id='enrichment-pipeline-1',
+    enable_idempotence=True,
+)
+producer.init_transactions()
+
+consumer = KafkaConsumer(
+    INPUT_TOPIC,
+    isolation_level='read_committed',  # Only read committed transactions
+)
+
+for msg in consumer:
+    enriched = enrich(msg)
+    try:
+        producer.begin_transaction()
+        producer.send(OUTPUT_TOPIC, enriched)
+        producer.send_offsets_to_transaction(
+            {TopicPartition(INPUT_TOPIC, msg.partition): msg.offset + 1},
+            consumer.config['group_id']
+        )
+        producer.commit_transaction()
+    except Exception:
+        producer.abort_transaction()
+```
+
+This pattern atomically commits the output message and the input offset — either both happen or neither does.
+
+## Monitoring: What Actually Matters
+
+Kafka exposes hundreds of JMX metrics. Focus on these:
+
+**Consumer lag per group per partition** — the #1 operational metric. Alert if lag exceeds your SLA window. Use Burrow or the Kafka consumer group offset API.
+
+**Under-replicated partitions** — should always be 0 in steady state. Spikes indicate broker issues or network problems.
+
+**Producer request latency p99** — if this spikes, your pipeline is backing up. Check broker disk I/O and network.
+
+**Fetch request rate vs bytes-consumed rate** — falling fetch rate with rising lag means consumers are failing to keep up. Scale consumers or optimize processing.
+
+```python
+# Prometheus metrics for consumer lag monitoring
+from prometheus_client import Gauge
+
+consumer_lag = Gauge(
+    'kafka_consumer_lag',
+    'Consumer group lag per topic partition',
+    ['group_id', 'topic', 'partition']
+)
+
+def update_lag_metrics(consumer: KafkaConsumer, group_id: str):
+    for tp in consumer.assignment():
+        end_offset = consumer.end_offsets([tp])[tp]
+        current_offset = consumer.position(tp)
+        consumer_lag.labels(
+            group_id=group_id,
+            topic=tp.topic,
+            partition=tp.partition
+        ).set(end_offset - current_offset)
+```
+
+## Schema Evolution with Schema Registry
+
+Raw JSON in Kafka is a recipe for silent schema breakage. Use Confluent Schema Registry with Avro or Protobuf:
+
+- Schemas are versioned and centrally stored
+- Producers can only publish schemas that are backward-compatible (configurable)
+- Consumers can read any compatible schema version
+- Schema ID is embedded in the message header — no per-message schema overhead
+
+This single change prevents the majority of production incidents in streaming pipelines I've seen.
+
+## Closing
+
+Kafka is incredibly powerful but operationally demanding. The patterns that matter most: right-sized partitioning from day one, manual offset commits, consumer lag monitoring, and Schema Registry. Get these right and your streaming pipelines will be both reliable and debuggable.

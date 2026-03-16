@@ -1,0 +1,138 @@
+[
+  {
+    "id": "realtime-streaming-pipeline",
+    "title": "10M events/day Kafka \u2192 Spark Streaming Pipeline",
+    "subtitle": "Exactly-once \u00b7 Late-event watermarks \u00b7 Sub-5s end-to-end latency \u00b7 AWS EMR",
+    "description": "Production Kafka \u2192 Spark Structured Streaming pipeline at 10M+ events/day with exactly-once delivery to Delta Lake. Implemented watermark-based late-event handling (30-min tolerance), idempotent MERGE upserts, and a dead-letter queue with automatic replay. Reduced end-to-end data latency from 8 minutes to under 5 seconds.",
+    "architecture": "Kafka (6 brokers, RF=3) \u2192 Spark SS (50 executors, 4-core) \u2192 Delta Lake MERGE \u2192 Looker",
+    "scale": "10M events/day \u00b7 6 Kafka brokers \u00b7 RF=3 \u00b7 exactly-once delivery",
+    "impact": "< 5s Latency \u00b7 0 Data Loss",
+    "impactColor": "cyan",
+    "tags": [
+      "Apache Kafka",
+      "Spark Structured Streaming",
+      "Delta Lake",
+      "AWS EMR",
+      "PySpark"
+    ],
+    "github": "https://github.com",
+    "demo": null,
+    "image": "",
+    "featured": true,
+    "year": 2024
+  },
+  {
+    "id": "enterprise-lakehouse-databricks",
+    "title": "Enterprise Lakehouse \u2014 Databricks Medallion Architecture",
+    "subtitle": "50+ siloed AWS Glue jobs \u2192 Bronze/Silver/Gold \u00b7 Unity Catalog \u00b7 60% faster pipelines",
+    "description": "Replaced a fragmented multi-warehouse topology (50+ isolated AWS Glue jobs, 8 engineering teams, no shared catalog) with a unified Delta Lake medallion architecture on Databricks. Unity Catalog for governance, automated schema contracts via dbt, Photon-powered Gold layer for BI and ML. Pipeline runtime dropped 60%, schema conflicts eliminated.",
+    "architecture": "S3 raw \u2192 Bronze (CDC) \u2192 Silver (dbt contracts) \u2192 Gold (Photon) \u2192 Unity Catalog",
+    "scale": "50+ sources \u00b7 8 teams \u00b7 100TB managed \u00b7 60% runtime reduction",
+    "impact": "\u221260% Pipeline Runtime \u00b7 Zero Schema Conflicts",
+    "impactColor": "green",
+    "tags": [
+      "Databricks",
+      "Delta Lake",
+      "PySpark",
+      "Unity Catalog",
+      "dbt",
+      "Apache Spark"
+    ],
+    "github": "https://github.com",
+    "demo": null,
+    "image": "",
+    "featured": true,
+    "year": 2024
+  },
+  {
+    "id": "warehouse-modernization",
+    "title": "100TB Warehouse Migration \u2014 Redshift & Oracle \u2192 Snowflake + BigQuery",
+    "subtitle": "Dual-write validation \u00b7 Zero downtime \u00b7 p95 query time 42s \u2192 11s",
+    "description": "Led migration of 100+ TB from on-premise Oracle and legacy AWS Redshift to Snowflake and BigQuery using a dual-write validation strategy. Re-modelled physical layer (micro-partition clustering, column ordering, incremental ELT with dbt). Achieved 70% query performance improvement and 40% cost reduction with zero-downtime cutover.",
+    "architecture": "Redshift/Oracle \u2192 Airbyte ingest \u2192 dbt transforms \u2192 Snowflake + BigQuery (dual-write)",
+    "scale": "100TB \u00b7 p95 42s\u219211s \u00b7 zero downtime \u00b7 6-month programme",
+    "impact": "70% Faster Queries \u00b7 40% Cost Saved",
+    "impactColor": "amber",
+    "tags": [
+      "Snowflake",
+      "BigQuery",
+      "dbt",
+      "Airflow",
+      "Python",
+      "Airbyte"
+    ],
+    "github": "https://github.com",
+    "demo": null,
+    "image": "",
+    "featured": false,
+    "year": 2023
+  },
+  {
+    "id": "ml-feature-store",
+    "title": "ML Feature Store \u2014 1,000+ Features, p99 < 8ms Online Serving",
+    "subtitle": "Dual-mode offline/online \u00b7 Point-in-time correct \u00b7 Zero training-serving skew",
+    "description": "Centralised dual-mode feature platform on Databricks: Delta Lake offline store (point-in-time correct for training) and Redis online store (p99 < 8ms for inference) backed by identical feature definitions. Eliminated training-serving skew across 4 ML teams, cut feature engineering time from days to hours.",
+    "architecture": "PySpark batch \u2192 Delta (offline) / Redis (online) \u00b7 MLflow lineage \u00b7 4 ML teams",
+    "scale": "1,000+ features \u00b7 p99 < 8ms \u00b7 4 ML teams \u00b7 zero training-serving skew",
+    "impact": "p99 < 8ms \u00b7 4 Teams \u00b7 0 Skew",
+    "impactColor": "violet",
+    "tags": [
+      "Databricks Feature Store",
+      "MLflow",
+      "PySpark",
+      "Redis",
+      "Delta Lake"
+    ],
+    "github": "https://github.com",
+    "demo": null,
+    "image": "",
+    "featured": false,
+    "year": 2024
+  },
+  {
+    "id": "fintech-credit-risk-pipeline",
+    "title": "Real-Time Credit Decisioning \u2014 48h Batch \u2192 < 2min Streaming",
+    "subtitle": "Kafka + PySpark micro-batch feature engineering \u00b7 100K+ apps/day \u00b7 95%+ accuracy",
+    "description": "Replaced overnight batch credit scoring with a Kafka-driven real-time pipeline. PySpark micro-batch feature engineering computes 200+ credit risk signals in real time, integrated with a REST model serving layer. Reduced decisioning latency from 48 hours to under 2 minutes while maintaining 95%+ model accuracy at 100K+ applications/day.",
+    "architecture": "Kafka \u2192 PySpark Structured Streaming \u2192 200+ features \u2192 Model API \u2192 PostgreSQL",
+    "scale": "100K+ apps/day \u00b7 200+ features \u00b7 48h\u2192<2min \u00b7 95%+ accuracy",
+    "impact": "48h \u2192 < 2min Decisioning",
+    "impactColor": "cyan",
+    "tags": [
+      "PySpark",
+      "Apache Kafka",
+      "PostgreSQL",
+      "AWS",
+      "Python",
+      "Spark Streaming"
+    ],
+    "github": "https://github.com",
+    "demo": null,
+    "image": "",
+    "featured": false,
+    "year": 2023
+  },
+  {
+    "id": "cost-governance-framework",
+    "title": "Data Platform Cost Governance \u2014 \u221240% Spend in 90 Days",
+    "subtitle": "Isolation Forest anomaly detection \u00b7 Terraform auto-remediation \u00b7 20+ Databricks workspaces",
+    "description": "Automated cost governance framework using Isolation Forest ML to detect runaway Spark clusters, enforce S3 \u2192 Glacier storage tiering, and rightsize compute across 20+ Databricks workspaces. Terraform-driven auto-remediation halts anomalous jobs and routes Slack/PagerDuty alerts with per-team chargeback attribution.",
+    "architecture": "Cost APIs (AWS + GCP + Databricks) \u2192 Isolation Forest \u2192 Terraform remediation \u2192 Slack",
+    "scale": "20+ workspaces \u00b7 $22K\u2192$14K/month \u00b7 90-day payback \u00b7 fully automated",
+    "impact": "\u221240% Cloud Spend \u00b7 90 Days",
+    "impactColor": "green",
+    "tags": [
+      "Python",
+      "Terraform",
+      "Databricks",
+      "AWS Cost Explorer",
+      "GCP",
+      "Isolation Forest"
+    ],
+    "github": "https://github.com",
+    "demo": null,
+    "image": "",
+    "featured": false,
+    "year": 2023
+  }
+]

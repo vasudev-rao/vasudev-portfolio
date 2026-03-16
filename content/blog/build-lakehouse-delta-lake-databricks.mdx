@@ -1,0 +1,224 @@
+---
+title: "How to Build a Lakehouse Using Delta Lake & Databricks"
+description: "A comprehensive guide to building a modern data lakehouse architecture using Delta Lake and Databricks, combining the best of data lakes and data warehouses."
+date: "2026-02-01"
+tags: ["Databricks", "Delta Lake", "Data Architecture"]
+---
+
+The lakehouse is not a new buzzword — it is a concrete architectural pattern that solves the fundamental tension between data lakes (cheap, flexible, unreliable) and data warehouses (expensive, rigid, reliable). Delta Lake on Databricks is the most mature implementation of this pattern available today.
+
+This guide covers building a production lakehouse from scratch: storage design, medallion architecture, governance, and operational concerns.
+
+## Why Lakehouse, Not Warehouse
+
+Before committing to the architecture, it's worth being precise about the trade-offs:
+
+**Data warehouse** (Snowflake, Redshift, BigQuery): ACID transactions, fast query performance, strong governance, expensive storage, proprietary format, limited ML integration.
+
+**Data lake** (raw S3/GCS + Spark): cheap storage, schema flexibility, supports any compute engine, no ACID guarantees, poor query performance on analytical workloads, data swamps at scale.
+
+**Lakehouse**: open storage format (Parquet + Delta transaction log), ACID transactions, fast query via data skipping and caching, native ML integration, separation of compute and storage.
+
+The critical enabler is Delta Lake's transaction log — a JSON-based commit log that sits alongside Parquet files and provides atomicity, isolation, and consistency without a proprietary catalog.
+
+## Storage Design
+
+Every lakehouse needs a deliberate storage topology. The pattern that scales:
+
+```
+s3://your-bucket/
+├── bronze/          # Raw, immutable, append-only
+│   ├── events/
+│   ├── orders/
+│   └── users/
+├── silver/          # Cleaned, deduplicated, typed
+│   ├── events/
+│   ├── orders/
+│   └── users/
+└── gold/            # Aggregated, domain-modeled, query-optimized
+    ├── finance/
+    ├── product/
+    └── marketing/
+```
+
+Key decisions:
+- **Partition strategy**: partition by ingestion date at bronze, by business date at silver and gold. Avoid high-cardinality partitions (user_id) — they create millions of small files.
+- **File sizing**: target 128MB–1GB Parquet files. Use `OPTIMIZE` to compact small files regularly.
+- **Retention**: set `delta.logRetentionDuration` and `delta.deletedFileRetentionDuration` based on your time-travel and audit requirements.
+
+## Medallion Architecture Implementation
+
+### Bronze Layer — Raw Ingestion
+
+Bronze is append-only. Never transform at this layer. The goal is a durable, replayable record of what arrived and when.
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp, lit
+from delta import DeltaTable
+
+spark = SparkSession.builder \
+    .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension") \
+    .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog") \
+    .getOrCreate()
+
+def ingest_bronze(source_path: str, target_path: str, source_name: str):
+    df = spark.read.json(source_path)
+    
+    # Add audit columns — never modify source columns at bronze
+    df = df \
+        .withColumn("_ingested_at", current_timestamp()) \
+        .withColumn("_source", lit(source_name)) \
+        .withColumn("_source_path", lit(source_path))
+    
+    df.write \
+        .format("delta") \
+        .mode("append") \
+        .partitionBy("_ingested_date") \
+        .save(target_path)
+```
+
+### Silver Layer — Cleansing and Deduplication
+
+Silver is the canonical, trusted version of each entity. Apply schema enforcement, type casting, deduplication, and null handling here.
+
+```python
+from pyspark.sql.functions import row_number, desc
+from pyspark.sql.window import Window
+
+def process_silver_orders(bronze_path: str, silver_path: str):
+    bronze_df = spark.read.format("delta").load(bronze_path)
+    
+    # Type casting and null handling
+    typed_df = bronze_df \
+        .withColumn("order_total", col("order_total").cast("decimal(18,2)")) \
+        .withColumn("created_at", to_timestamp(col("created_at"))) \
+        .filter(col("order_id").isNotNull()) \
+        .filter(col("order_total") >= 0)
+    
+    # Deduplication — keep latest record per order_id
+    window = Window.partitionBy("order_id").orderBy(desc("_ingested_at"))
+    deduped_df = typed_df \
+        .withColumn("rn", row_number().over(window)) \
+        .filter(col("rn") == 1) \
+        .drop("rn")
+    
+    # Merge into silver (upsert)
+    if DeltaTable.isDeltaTable(spark, silver_path):
+        silver_table = DeltaTable.forPath(spark, silver_path)
+        silver_table.alias("target").merge(
+            deduped_df.alias("source"),
+            "target.order_id = source.order_id"
+        ) \
+        .whenMatchedUpdateAll() \
+        .whenNotMatchedInsertAll() \
+        .execute()
+    else:
+        deduped_df.write.format("delta").partitionBy("created_date").save(silver_path)
+```
+
+### Gold Layer — Aggregation and Domain Modeling
+
+Gold serves analysts and dashboards. Optimize for read performance: pre-aggregate, pre-join, and cluster on query-critical columns.
+
+```python
+def build_gold_daily_revenue(silver_orders_path: str, gold_path: str):
+    orders = spark.read.format("delta").load(silver_orders_path)
+    
+    daily_revenue = orders \
+        .filter(col("status") == "completed") \
+        .groupBy("created_date", "region", "product_category") \
+        .agg(
+            sum("order_total").alias("total_revenue"),
+            count("order_id").alias("order_count"),
+            avg("order_total").alias("avg_order_value"),
+            countDistinct("customer_id").alias("unique_customers")
+        )
+    
+    daily_revenue.write \
+        .format("delta") \
+        .mode("overwrite") \
+        .option("replaceWhere", f"created_date = '{processing_date}'") \
+        .save(gold_path)
+```
+
+## Performance Optimization
+
+### Z-Ordering
+
+Z-ordering collocates related data in the same files, reducing the number of files scanned for selective queries.
+
+```sql
+OPTIMIZE silver.orders
+ZORDER BY (customer_id, created_date);
+```
+
+Use Z-ordering on columns that appear frequently in `WHERE` clauses but have too high cardinality to partition on. Effective for: `customer_id`, `product_id`, `region`.
+
+### Data Skipping
+
+Delta Lake maintains column-level min/max statistics in the transaction log. Queries with range predicates on partitioned or Z-ordered columns skip files automatically. Monitor skipping effectiveness:
+
+```sql
+DESCRIBE DETAIL silver.orders;
+-- Check: numFiles, sizeInBytes, partitionColumns
+```
+
+### Caching
+
+For gold-layer tables accessed repeatedly by dashboards, enable Delta Caching on Databricks compute:
+
+```python
+spark.conf.set("spark.databricks.io.cache.enabled", "true")
+spark.conf.set("spark.databricks.io.cache.maxDiskUsage", "50g")
+```
+
+## Governance with Unity Catalog
+
+Unity Catalog provides centralized access control, lineage, and auditing across all Databricks workspaces.
+
+Key setup:
+
+```sql
+-- Create a catalog per environment
+CREATE CATALOG IF NOT EXISTS prod;
+CREATE CATALOG IF NOT EXISTS dev;
+
+-- Create schemas per domain
+CREATE SCHEMA IF NOT EXISTS prod.finance;
+CREATE SCHEMA IF NOT EXISTS prod.product;
+
+-- Grant access by role
+GRANT SELECT ON SCHEMA prod.finance TO `finance-analysts`;
+GRANT ALL PRIVILEGES ON SCHEMA prod.finance TO `data-engineers`;
+
+-- Column-level masking for PII
+CREATE OR REPLACE FUNCTION prod.mask_email(email STRING)
+RETURNS STRING
+RETURN CASE WHEN is_account_group_member('pii-access') 
+            THEN email 
+            ELSE CONCAT(LEFT(email, 2), '***@***.***') 
+       END;
+```
+
+## Operational Runbook
+
+**Weekly maintenance:**
+```sql
+-- Compact small files
+OPTIMIZE bronze.events;
+OPTIMIZE silver.orders ZORDER BY (customer_id);
+
+-- Remove files no longer referenced by Delta
+VACUUM silver.orders RETAIN 168 HOURS;  -- 7 days
+
+-- Analyze table statistics for query optimization
+ANALYZE TABLE gold.daily_revenue COMPUTE STATISTICS;
+```
+
+**Monitoring:**
+- Track `delta_log` size growth — large logs indicate frequent small commits
+- Alert on partition skew: one partition >10× the median size
+- Monitor job duration trends — consistent increase signals file fragmentation
+
+The lakehouse pattern delivers when it is operated, not just deployed. The architecture is sound; the discipline is in the maintenance.
