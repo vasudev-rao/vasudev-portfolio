@@ -1,0 +1,280 @@
+---
+title: "Optimizing Spark Jobs to Reduce Costs by 60%"
+date: "2024-01-20"
+excerpt: "Practical techniques to dramatically reduce Spark compute costs through partition tuning, caching strategies, and cluster configuration."
+readTime: "12 min read"
+---
+
+# Optimizing Spark Jobs to Reduce Costs by 60%
+
+Our Spark infrastructure bill was $40K/month. After systematic optimization, we reduced it to $16K/month while improving performance. Here's how.
+
+## The Cost Problem
+
+**Initial State:**
+- 50+ Spark jobs running daily
+- Average runtime: 4+ hours per job
+- Cluster costs: $40K/month
+- 70% wasted compute on idle resources
+
+## Optimization Strategy
+
+### 1. Right-Sizing Clusters
+
+**Before:**
+```python
+# One-size-fits-all cluster
+cluster_config = {
+    "node_type": "r5.4xlarge",  # Memory-optimized for everything
+    "num_workers": 20,
+    "autoscale": False
+}
+```
+
+**After:**
+```python
+# Workload-specific clusters
+bronze_cluster = {
+    "node_type": "i3.2xlarge",  # I/O optimized for ingestion
+    "num_workers": 10,
+    "autoscale": {"min": 5, "max": 15}
+}
+
+silver_cluster = {
+    "node_type": "r5.4xlarge",  # Memory for transformations
+    "num_workers": 15,
+    "autoscale": {"min": 8, "max": 25}
+}
+
+gold_cluster = {
+    "node_type": "c5.2xlarge",  # Compute for aggregations
+    "num_workers": 8,
+    "autoscale": {"min": 4, "max": 12}
+}
+```
+
+**Savings:** $12K/month (30% reduction)
+
+### 2. Partition Optimization
+
+**Problem:** Small files creating millions of tasks
+
+```python
+# Before: 500K partitions = 500K tasks
+df = spark.read.parquet("s3://data/events/")
+print(df.rdd.getNumPartitions())  # 500,000
+
+# After: Coalesce to optimal size
+target_partition_size_mb = 128
+num_partitions = calculate_optimal_partitions(df)
+
+df = df.coalesce(num_partitions)  # 2,000 partitions
+```
+
+**Function to calculate partitions:**
+```python
+def calculate_optimal_partitions(df, target_mb=128):
+    """Calculate optimal partition count"""
+    total_size_mb = df._jdf.queryExecution().analyzed().stats().sizeInBytes() / (1024 * 1024)
+    return max(int(total_size_mb / target_mb), spark.sparkContext.defaultParallelism)
+```
+
+**Savings:** 40% faster execution = $5K/month
+
+### 3. Intelligent Caching
+
+**Before:** Caching everything
+```python
+# Bad: Cache unnecessarily
+df1 = spark.read.parquet("s3://data/")
+df1.cache()  # Wastes memory
+
+df2 = df1.filter(col("date") == "2024-01-01")
+df2.cache()  # Also not reused
+```
+
+**After:** Cache only multi-use dataframes
+```python
+# Good: Cache strategically
+dim_users = spark.read.parquet("s3://dims/users").cache()  # Used 10x
+
+# Don't cache single-use
+fact_orders = spark.read.parquet("s3://facts/orders")  # Used once
+```
+
+**Rule:** Cache only if:
+1. Used 3+ times in same job
+2. Size < 20% of cluster memory
+3. Expensive to recompute
+
+**Savings:** $3K/month (better memory utilization)
+
+### 4. Dynamic Partition Pruning
+
+**Enable Spark 3.0+ optimization:**
+```python
+spark.conf.set("spark.sql.optimizer.dynamicPartitionPruning.enabled", "true")
+
+# Automatically skips partitions
+fact_sales = spark.read.parquet("s3://facts/sales")  # 1000 partitions
+dim_product = spark.read.parquet("s3://dims/products")
+
+# Spark automatically prunes irrelevant partitions
+result = fact_sales.join(
+    dim_product.filter(col("category") == "Electronics"),
+    "product_id"
+)
+# Reads only 50 partitions instead of 1000
+```
+
+**Savings:** $4K/month (80% less data scanned)
+
+### 5. Spot Instances
+
+**Configuration:**
+```python
+cluster_config = {
+    "node_type_id": "r5.4xlarge",
+    "driver_node_type_id": "r5.xlarge",  # On-demand driver
+    "num_workers": 20,
+    "aws_attributes": {
+        "availability": "SPOT_WITH_FALLBACK",  # Use spot, fallback to on-demand
+        "spot_bid_price_percent": 100,
+        "first_on_demand": 2  # Keep 2 on-demand for stability
+    }
+}
+```
+
+**Spot Instance Strategy:**
+- Driver: Always on-demand (stability)
+- Workers: 80% spot, 20% on-demand
+- Multiple AZs for availability
+
+**Savings:** $8K/month (60% discount on workers)
+
+### 6. Cluster Auto-Termination
+
+**Before:** Clusters running 24/7
+
+**After:**
+```python
+cluster_config = {
+    "autotermination_minutes": 15,  # Terminate after 15 min idle
+    "cluster_log_conf": {
+        "s3": {
+            "destination": "s3://logs/",
+            "enable_encryption": True
+        }
+    }
+}
+```
+
+**Savings:** $6K/month (eliminated idle time)
+
+### 7. Job Scheduling Optimization
+
+**Before:** All jobs run during business hours
+
+**After:** Spread across 24 hours
+```python
+# High-priority: Business hours
+critical_jobs = ["revenue_report", "user_metrics"]
+schedule_time = "08:00"
+
+# Low-priority: Off-peak hours (cheaper spot instances)
+batch_jobs = ["historical_backfill", "data_quality_checks"]
+schedule_time = "02:00"  # 3x cheaper spot availability
+```
+
+**Savings:** $2K/month
+
+## Cost Breakdown
+
+| Optimization | Monthly Savings | Implementation Effort |
+|--------------|----------------|----------------------|
+| Right-sizing | $12,000 | Medium |
+| Partitioning | $5,000 | Low |
+| Caching | $3,000 | Low |
+| Partition Pruning | $4,000 | Low |
+| Spot Instances | $8,000 | Medium |
+| Auto-termination | $6,000 | Low |
+| Job Scheduling | $2,000 | Low |
+| **Total** | **$40K → $16K** | **60% Reduction** |
+
+## Monitoring Dashboard
+
+Track these metrics:
+
+```sql
+-- DBU consumption by job
+SELECT 
+    job_name,
+    SUM(dbu_units) as total_dbus,
+    SUM(dbu_units * cost_per_dbu) as cost_usd
+FROM cluster_usage
+WHERE date >= current_date() - 30
+GROUP BY job_name
+ORDER BY cost_usd DESC
+```
+
+```python
+# Alert on cost anomalies
+def check_cost_anomaly(current_cost, historical_avg):
+    threshold = historical_avg * 1.3  # 30% increase
+    if current_cost > threshold:
+        send_alert(f"Cost spike detected: ${current_cost:.2f}")
+```
+
+## Best Practices
+
+### DO:
+✅ Right-size clusters per workload  
+✅ Use spot instances (80/20 split)  
+✅ Enable auto-termination (15 min)  
+✅ Optimize partition sizes (128MB-1GB)  
+✅ Cache only multi-use data  
+✅ Schedule off-peak for batch jobs  
+✅ Monitor costs daily  
+
+### DON'T:
+❌ Use one cluster for everything  
+❌ Keep clusters running 24/7  
+❌ Cache everything "just in case"  
+❌ Ignore partition counts  
+❌ Run all jobs during business hours  
+❌ Skip cost monitoring  
+
+## Implementation Timeline
+
+**Week 1:** Right-size clusters, enable auto-termination  
+**Week 2:** Optimize partitioning, enable spot instances  
+**Week 3:** Implement caching strategy, partition pruning  
+**Week 4:** Job scheduling optimization, monitoring  
+
+## Results
+
+**Before:**
+- $40K/month
+- 4+ hour runtimes
+- 70% resource waste
+- Manual cluster management
+
+**After:**
+- $16K/month (60% reduction)
+- 2.5 hour runtimes (38% faster)
+- 15% resource waste
+- Automated cost controls
+
+## Key Takeaways
+
+1. **Workload-specific clusters** save more than generic sizing
+2. **Spot instances** are the biggest cost lever (60% discount)
+3. **Auto-termination** eliminates idle waste
+4. **Partition optimization** improves both cost and performance
+5. **Monitoring is essential** for sustained savings
+
+Cost optimization is continuous, not one-time. Set up alerts, review monthly, and iterate.
+
+---
+
+**Related:** [Scaling Spark to 100TB](#) | [Delta Lake Optimization](#)

@@ -1,0 +1,88 @@
+---
+title: "Data Quality & Observability in Data Pipelines: What Most Engineers Miss"
+date: "2026-04-30"
+excerpt: "How I design data pipelines with built-in data quality checks, monitoring, and observability for production reliability."
+tags: ["Data Engineering", "Observability", "Data Quality", "Architecture"]
+readTime: "9 min read"
+---
+
+# Data Quality & Observability in Data Pipelines
+
+## 🚀 Context
+
+Most data pipelines fail silently.
+
+Not because they crash —  
+but because they produce **wrong data**.
+
+In production, correctness matters more than completion.
+
+This post explains how I design pipelines with **built-in data quality and observability**.
+
+---
+
+## ⚠️ The Real Problem
+
+Typical pipelines focus on:
+- Data ingestion  
+- Transformation  
+- Storage  
+
+But ignore:
+- Data correctness  
+- Monitoring  
+- Alerting  
+
+👉 Result:
+- Incorrect dashboards  
+- Broken business decisions  
+- Loss of trust in data  
+
+---
+
+## 🧠 Key Principle
+
+> A successful pipeline is not one that runs —  
+> it’s one that produces **correct, trustworthy data**
+
+---
+
+## 🔍 Types of Data Quality Issues
+
+### 1. Schema changes
+- New columns  
+- Changed data types  
+
+---
+
+### 2. Missing data
+- Null spikes  
+- Incomplete ingestion  
+
+---
+
+### 3. Duplicate data
+- Retry failures  
+- Upstream issues  
+
+---
+
+### 4. Delayed data
+- Late-arriving events  
+- Pipeline lag  
+
+---
+
+## ⚙️ Data Quality Checks
+
+### 1. Schema validation
+
+- Enforce schema at ingestion  
+- Reject invalid records  
+
+---
+
+### 2. Null checks
+
+```python
+df.filter(df["user_id"].isNull()).count()

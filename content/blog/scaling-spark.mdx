@@ -1,0 +1,82 @@
+---
+title: "Scaling Spark to 100TB: Production Patterns"
+date: "2024-03-15"
+excerpt: "Lessons learned optimizing Spark jobs to process 100TB+ datasets efficiently. Real patterns from production systems."
+readTime: "10 min read"
+---
+
+# Scaling Spark to 100TB: Production Patterns
+
+Processing 100TB+ of data with Apache Spark requires understanding failure modes that only appear at scale.
+
+## The Challenge
+
+Our lakehouse ingested 50+ TB daily from Kafka, APIs, and CDC streams. Initial Spark jobs took 18+ hours to complete, missing SLA windows.
+
+## Core Optimizations
+
+### 1. Partition Sizing
+
+**Problem:** Default 200 partitions led to tiny tasks and massive scheduler overhead.
+
+**Solution:**
+```python
+# Calculate optimal partitions
+target_partition_size_mb = 128
+total_data_size_mb = df.count() * avg_row_size_bytes / (1024 * 1024)
+optimal_partitions = int(total_data_size_mb / target_partition_size_mb)
+
+df = df.repartition(optimal_partitions)
+```
+
+**Impact:** Runtime reduced from 18hrs → 6hrs
+
+### 2. Broadcast Joins
+
+**Problem:** Large shuffles for dimension table joins.
+
+**Solution:**
+```python
+from pyspark.sql.functions import broadcast
+
+# Broadcast tables < 10GB
+fact_df.join(broadcast(dim_df), "key")
+```
+
+**Impact:** Eliminated 2TB of shuffle
+
+### 3. Adaptive Query Execution
+
+**Enable AQE for dynamic optimization:**
+```python
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+```
+
+## Delta Lake Optimizations
+
+### OPTIMIZE and Z-ORDER
+
+```python
+# Weekly optimization
+spark.sql("OPTIMIZE events ZORDER BY (date, user_id)")
+
+# Auto-optimize on write
+spark.conf.set("spark.databricks.delta.properties.defaults.autoOptimize.optimizeWrite", "true")
+```
+
+**Impact:** Query performance improved 5x
+
+## Key Takeaways
+
+1. **Partition size matters** - 128MB-1GB sweet spot
+2. **Broadcast small tables** - Eliminates unnecessary shuffles
+3. **Use Delta Lake** - ACID + time travel + optimization
+4. **Monitor metrics** - Shuffle spill = performance killer
+5. **AQE is magic** - Let Spark optimize at runtime
+
+Production Spark is about understanding data distribution, not just writing transformations.
+
+---
+
+**Related:** [Kafka vs Kinesis](#) | [Delta Lake Optimization](#)

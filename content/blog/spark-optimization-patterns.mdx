@@ -1,0 +1,168 @@
+---
+title: "Optimizing Spark Jobs: 10 Patterns That Cut Costs by 60%"
+date: "2024-03-15"
+excerpt: "Deep dive into Spark optimization techniques including broadcast joins, partition tuning, and cache strategies that dramatically reduce cluster costs."
+tags: ["spark", "optimization", "cost", "pyspark"]
+readTime: "8 min read"
+---
+
+# Optimizing Spark Jobs: 10 Patterns That Cut Costs by 60%
+
+After running production Spark workloads processing 50TB+ of data, I've learned that the difference between an expensive cluster and a cost-efficient one often comes down to applying the right optimization patterns.
+
+## The Problem
+
+Our data platform was processing batch jobs that took 6+ hours and cost $1,200 per run. After applying systematic optimizations, we reduced runtime to 90 minutes and cut costs by 60% while processing the same data volumes.
+
+## 10 Optimization Patterns
+
+### 1. Broadcast Joins for Dimension Tables
+
+**Before:**
+```python
+# Shuffle join - moves data across network
+large_df.join(dimension_df, "key")
+```
+
+**After:**
+```python
+from pyspark.sql.functions import broadcast
+
+# Broadcast small table to all executors
+large_df.join(broadcast(dimension_df), "key")
+```
+
+**Impact:** 10x faster joins when dimension table < 200MB. Eliminates expensive shuffle operations.
+
+### 2. Partition Pruning with Filter Pushdown
+
+Structure your data with partition columns and filter early:
+
+```python
+# Partitioned by date
+df = spark.read.parquet("s3://bucket/data/")
+
+# Prune partitions BEFORE other operations
+df = df.filter(col("date") >= "2024-01-01")
+```
+
+**Impact:** Read only 5% of data instead of full scan.
+
+### 3. Adaptive Query Execution (AQE)
+
+Enable AQE for runtime optimizations:
+
+```python
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+```
+
+**Impact:** Handles data skew automatically, optimizes partition count dynamically.
+
+### 4. Cache Strategically
+
+```python
+# Cache when data is reused multiple times
+df_filtered = df.filter(expensive_condition).cache()
+
+# Use in multiple operations
+result1 = df_filtered.groupBy("col1").count()
+result2 = df_filtered.groupBy("col2").sum("value")
+
+# Don't forget to unpersist
+df_filtered.unpersist()
+```
+
+**Impact:** 5x speedup for iterative algorithms.
+
+### 5. Avoid Wide Transformations When Possible
+
+```python
+# BAD: Creates huge shuffle
+df.groupBy("high_cardinality_col").agg(...)
+
+# BETTER: Pre-aggregate locally first
+df.repartition("high_cardinality_col") \
+  .groupBy("high_cardinality_col") \
+  .agg(...)
+```
+
+### 6. Optimize Partition Count
+
+```python
+# Rule of thumb: 2-4 partitions per CPU core
+num_partitions = num_executors * cores_per_executor * 3
+
+df.repartition(num_partitions).write.parquet("output/")
+```
+
+### 7. Use Columnar Formats
+
+Always use Parquet or ORC, never CSV in production:
+
+```python
+# Compression + columnar storage
+df.write.mode("overwrite") \
+  .option("compression", "snappy") \
+  .parquet("s3://bucket/optimized/")
+```
+
+**Impact:** 10x smaller files, 5x faster reads.
+
+### 8. Handle Data Skew
+
+```python
+from pyspark.sql.functions import rand
+
+# Add salt to skewed keys
+df_salted = df.withColumn("salted_key", 
+  concat(col("key"), lit("_"), (rand() * 10).cast("int")))
+
+# Join on salted key
+result = df_salted.join(other_df_salted, "salted_key")
+```
+
+### 9. Minimize Small Files
+
+```python
+# Coalesce before writing
+df.coalesce(num_files).write.parquet("output/")
+
+# Or use repartition for balanced distribution
+df.repartition(num_files, "partition_col").write.parquet("output/")
+```
+
+### 10. Monitor with Spark UI
+
+Key metrics to watch:
+- **Stage duration**: Identify bottleneck stages
+- **Shuffle read/write**: High shuffle = optimization opportunity
+- **Spill to disk**: Indicates memory pressure
+- **Task duration skew**: Look for data skew
+
+## Real-World Impact
+
+On our 50TB enterprise lakehouse migration:
+
+- **Runtime:** 6 hours → 90 minutes (75% reduction)
+- **Cost:** $1,200 → $480 per run (60% savings)
+- **Resource utilization:** 40% → 85%
+- **Annual savings:** ~$250K
+
+## Key Takeaways
+
+1. Start with data partitioning and format optimization
+2. Use broadcast joins for dimension tables
+3. Enable Adaptive Query Execution
+4. Monitor Spark UI to identify bottlenecks
+5. Test optimizations on representative data samples
+6. Document cluster configurations that work
+
+Optimization is iterative. Measure, optimize, repeat.
+
+---
+
+**Next Steps:**
+- Read about [Delta Lake optimization patterns](/blog/delta-lake-optimization)
+- Check out my [lakehouse architecture project](/projects/enterprise-lakehouse)

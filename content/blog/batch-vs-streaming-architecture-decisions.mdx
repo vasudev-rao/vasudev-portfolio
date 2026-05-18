@@ -1,0 +1,81 @@
+---
+title: "Batch vs Streaming: How I Decide in Real-World Data Systems"
+date: "2026-05-01"
+excerpt: "A practical guide to choosing between batch and streaming based on latency, cost, complexity, and business needs."
+tags: ["Architecture", "Streaming", "Batch", "System Design"]
+readTime: "8 min read"
+---
+
+# Batch vs Streaming: How I Decide in Real-World Systems
+
+## 🚀 Context
+
+One of the most common questions in data engineering is:
+
+> Should we use batch or streaming?
+
+In reality, this is not a technical question —  
+it’s a **business + architecture decision**.
+
+---
+
+## ⚠️ The Wrong Approach
+
+Most teams think:
+
+- Streaming = modern  
+- Batch = outdated  
+
+👉 This is incorrect.
+
+Both have their place.
+
+---
+
+## 🧠 Core Decision Factors
+
+### 1. Latency requirements
+
+- **Real-time dashboards** → Streaming  
+- **Daily reports** → Batch  
+
+👉 Always start with business need
+
+---
+
+### 2. Data volume
+
+- Large historical data → Batch  
+- Continuous event streams → Streaming  
+
+---
+
+### 3. Cost considerations
+
+Streaming:
+- Always running → higher cost  
+
+Batch:
+- Runs periodically → cheaper  
+
+---
+
+### 4. Complexity
+
+Streaming:
+- Harder to build and maintain  
+- Requires handling late data, state, failures  
+
+Batch:
+- Simpler logic  
+- Easier debugging  
+
+---
+
+## 🏗️ Hybrid Approach (Most Practical)
+
+In most real systems, I use:
+
+```bash
+Streaming → Bronze layer  
+Batch → Silver / Gold layers  

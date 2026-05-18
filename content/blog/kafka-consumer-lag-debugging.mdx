@@ -1,0 +1,87 @@
+---
+title: "Debugging Kafka Consumer Lag in Production: A Real Case Study"
+date: "2026-04-27"
+excerpt: "How I diagnosed and fixed Kafka consumer lag causing delays in a real-time data pipeline."
+tags: ["Kafka", "Streaming", "Debugging", "Data Engineering"]
+readTime: "9 min read"
+---
+
+# Debugging Kafka Consumer Lag in Production
+
+## 🚀 Context
+
+In a real-time streaming pipeline (Kafka → Spark), we suddenly observed:
+
+- Increasing Kafka consumer lag  
+- Delayed data in dashboards  
+- SLA violations  
+
+This post walks through how I diagnosed and fixed the issue.
+
+---
+
+## ⚠️ Problem
+
+The system initially worked fine, but under load:
+
+- Lag kept increasing over time  
+- Consumers couldn't keep up with producers  
+- Data freshness dropped from seconds → minutes  
+
+👉 Business impact:
+- Delayed analytics  
+- Loss of real-time visibility  
+
+---
+
+## 🔍 Step 1: Identify the bottleneck
+
+First, I checked:
+
+- Kafka consumer lag metrics  
+- Spark streaming batch duration  
+- Processing vs ingestion rate  
+
+👉 Observation:
+- Processing time > ingestion rate  
+
+➡️ Clear sign: **consumer side bottleneck**
+
+---
+
+## 🔎 Step 2: Analyze Spark job
+
+Using Spark UI:
+
+- Long-running stages  
+- Skewed tasks  
+- High shuffle time  
+
+👉 Root issue:
+- Data skew in certain partitions  
+
+---
+
+## ⚠️ Step 3: Check Kafka partitioning
+
+- Few partitions had heavy traffic  
+- Others were underutilized  
+
+👉 Result:
+- Uneven load distribution  
+
+---
+
+## ⚙️ Fixes Applied
+
+### 1. Increased Kafka partitions
+
+- Improved parallelism  
+- Balanced load  
+
+---
+
+### 2. Repartitioned data in Spark
+
+```python
+df = df.repartition(200)

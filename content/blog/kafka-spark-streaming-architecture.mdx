@@ -1,0 +1,40 @@
+---
+title: "Designing a 10M Events/Day Kafka → Spark Streaming Pipeline"
+date: "2026-04-25"
+excerpt: "How I built a real-time streaming pipeline with sub-5s latency, exactly-once guarantees, and 0 data loss."
+tags: ["Kafka", "Spark", "Streaming", "Architecture"]
+readTime: "10 min read"
+---
+
+# Designing a 10M Events/Day Kafka → Spark Streaming Pipeline
+
+## 🚀 Context
+
+In one of my recent projects, I had to design a real-time data pipeline that could:
+
+- Handle **10M+ events/day**
+- Deliver **<5 second latency**
+- Guarantee **exactly-once processing**
+- Maintain **high reliability (99.9% uptime)**
+
+This post breaks down how I approached it.
+
+---
+
+## ⚠️ Problem
+
+The existing system was batch-based:
+
+- ~8 minute delay in data availability  
+- Duplicate records due to retries  
+- No handling of late-arriving events  
+- Manual recovery on failures  
+
+👉 Result: unreliable analytics and delayed decision-making
+
+---
+
+## 🏗️ Architecture
+
+```bash
+Producers → Kafka → Spark Structured Streaming → Delta Lake → BI

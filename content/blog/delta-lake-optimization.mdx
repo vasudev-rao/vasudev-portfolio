@@ -1,0 +1,111 @@
+---
+title: "Delta Lake Optimization: From Slow to Fast"
+date: "2024-01-10"
+excerpt: "Practical techniques that reduced our Delta Lake query times by 80%. OPTIMIZE, Z-ORDER, and partitioning strategies."
+readTime: "7 min read"
+---
+
+# Delta Lake Optimization: From Slow to Fast
+
+Our Delta Lake queries went from 45 seconds to 8 seconds. Here's how.
+
+## The Problem
+
+Bronze layer had 500K small files (8MB each). Queries scanned everything even with partition filters.
+
+## Optimization 1: File Compaction
+
+**Before:**
+- 500K files @ 8MB = inefficient I/O
+- List files took 30+ seconds
+
+**After OPTIMIZE:**
+```sql
+OPTIMIZE events
+```
+
+**Result:**
+- 500K files → 2,000 files @ 1GB
+- Query time: 45s → 22s
+
+## Optimization 2: Z-ORDERING
+
+**Purpose:** Co-locate related data
+
+```sql
+OPTIMIZE events
+ZORDER BY (date, user_id)
+```
+
+**Impact:**
+- Data skipping improved 10x
+- Query time: 22s → 8s
+
+**Rule:** Z-ORDER on 2-4 high-cardinality columns you filter on
+
+## Optimization 3: Liquid Clustering
+
+**Better than static partitioning:**
+```python
+spark.sql("""
+    CREATE TABLE events_v2
+    USING delta
+    CLUSTER BY (date, region)
+    AS SELECT * FROM events
+""")
+```
+
+**Benefits:**
+- Auto-compaction
+- No partition explosion
+- Change clustering keys anytime
+
+## Optimization 4: Auto-Optimize
+
+**Enable on write:**
+```python
+spark.sql("""
+    ALTER TABLE events
+    SET TBLPROPERTIES (
+        'delta.autoOptimize.optimizeWrite' = 'true',
+        'delta.autoOptimize.autoCompact' = 'true'
+    )
+""")
+```
+
+**Result:** Maintain optimal file sizes automatically
+
+## Cost vs Benefit
+
+| Operation | Cost | Benefit | Frequency |
+|-----------|------|---------|-----------|
+| OPTIMIZE | High | High | Weekly |
+| Z-ORDER | Medium | Medium | Monthly |
+| Liquid Clustering | Low | High | On write |
+| Auto-Optimize | Low | High | Always on |
+
+## Production Pattern
+
+```python
+# Daily compaction for hot tables
+spark.sql("OPTIMIZE events_today")
+
+# Weekly Z-ORDER for warm tables
+spark.sql("OPTIMIZE events_week ZORDER BY (date, user_id)")
+
+# Monthly full optimization
+spark.sql("OPTIMIZE events ZORDER BY (date, user_id)")
+```
+
+## Key Lessons
+
+1. **File size matters** - Target 128MB-1GB
+2. **Z-ORDER wisely** - Only frequently filtered columns
+3. **Auto-optimize** - Set it and forget it
+4. **Measure impact** - Track query performance
+
+Delta Lake optimization is ongoing, not one-time.
+
+---
+
+**Related:** [Scaling Spark](#) | [Kafka vs Kinesis](#)
