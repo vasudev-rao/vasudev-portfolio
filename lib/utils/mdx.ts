@@ -21,10 +21,15 @@ export function getTutorialMDX(slug: string): TutorialMDX {
   const filePath = path.join(CONTENT_DIR, `${slug}.mdx`)
 
   if (!fs.existsSync(filePath)) {
-    return { meta: {}, content: '', exists: false }
+    return {
+      meta: {},
+      content: '',
+      exists: false,
+    }
   }
 
   const raw = fs.readFileSync(filePath, 'utf-8')
+
   const { data, content } = matter(raw)
 
   return {

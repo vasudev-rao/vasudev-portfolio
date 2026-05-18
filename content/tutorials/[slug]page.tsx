@@ -1,11 +1,10 @@
 import { tutorials } from '@/lib/data/tutorials'
-import { getTutorialMDX } from '@/lib/mdx'
+import { getTutorialMDX } from '@/lib/utils/mdx'
 import { notFound } from 'next/navigation'
 import Link from 'next/link'
 import { ArrowLeft, Clock, FileDown } from 'lucide-react'
 import { MDXRemote } from 'next-mdx-remote/rsc'
-import { MDXComponents } from '@/components/mdx/MDXComponents'
-
+import { MDXComponents } from '@/components/ui/MDXComponents'
 export async function generateStaticParams() {
   return tutorials.filter(t => !t.comingSoon).map((t) => ({ slug: t.slug }))
 }
