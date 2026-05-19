@@ -161,7 +161,7 @@ export default function ContactPage() {
                 {[
                   { Icon: Mail, label: 'contact@vasudevarao.com', sub: 'Email', href: 'mailto:contact@vasudevarao.com' },
                   { Icon: Github, label: 'vasudev-rao', sub: 'GitHub', href: 'https://github.com/vasudev-rao' },
-                  { Icon: Linkedin, label: 'vasudevarao', sub: 'LinkedIn', href: 'https://linkedin.com/in/vasudevarao' },
+                  { Icon: Linkedin, label: 'vasudevarao', sub: 'LinkedIn', href: 'https://linkedin.com/in/vasudeva-rao-15b44a392' },
                 ].map(({ Icon, label, sub, href }) => (
                   <a key={label} href={href} target="_blank" rel="noopener noreferrer"
                     className="group flex items-center gap-3 p-3 rounded-xl border border-white/[0.05] bg-white/[0.02] hover:bg-blue-500/[0.06] hover:border-blue-500/20 transition-all duration-200">
