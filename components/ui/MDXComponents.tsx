@@ -1,26 +1,26 @@
-import type { MDXComponents as MDXComponentsType } from 'mdx/types'
+import type { MDXComponents } from 'mdx/types'
 
-export const MDXComponents: MDXComponentsType = {
+export const MDXComponents: MDXComponents = {
   h1: ({ children }) => (
-    <h1 className="text-3xl font-bold dark:text-white text-gray-900 mt-10 mb-4 leading-tight tracking-tight">
+    <h1 className="text-4xl font-bold text-gray-900 dark:text-white mt-12 mb-6 leading-tight tracking-tight">
       {children}
     </h1>
   ),
 
   h2: ({ children }) => (
-    <h2 className="text-2xl font-bold dark:text-white text-gray-900 mt-8 mb-3 leading-tight pb-2 border-b dark:border-white/[0.07] border-black/[0.07]">
+    <h2 className="text-3xl font-bold text-gray-900 dark:text-white mt-10 mb-4 pb-3 border-b border-black/[0.08] dark:border-white/[0.08]">
       {children}
     </h2>
   ),
 
   h3: ({ children }) => (
-    <h3 className="text-lg font-semibold dark:text-white text-gray-900 mt-6 mb-2">
+    <h3 className="text-2xl font-semibold text-gray-900 dark:text-white mt-8 mb-3">
       {children}
     </h3>
   ),
 
   p: ({ children }) => (
-    <p className="dark:text-gray-400 text-gray-500 leading-relaxed mb-4">
+    <p className="text-gray-700 dark:text-gray-300 leading-8 mb-6 text-[17px]">
       {children}
     </p>
   ),
@@ -30,74 +30,209 @@ export const MDXComponents: MDXComponentsType = {
       href={href}
       target="_blank"
       rel="noopener noreferrer"
-      className="text-blue-500 dark:text-blue-400 hover:text-blue-400 dark:hover:text-blue-300 underline underline-offset-2 transition-colors"
+      className="
+        text-blue-600
+        dark:text-blue-400
+
+        hover:text-blue-500
+        dark:hover:text-blue-300
+
+        underline
+        underline-offset-4
+        transition-colors
+      "
     >
       {children}
     </a>
   ),
 
   ul: ({ children }) => (
-    <ul className="list-disc list-inside dark:text-gray-400 text-gray-500 space-y-1.5 mb-4 pl-2">
+    <ul className="list-disc pl-6 text-gray-700 dark:text-gray-300 space-y-2 mb-6">
       {children}
     </ul>
   ),
 
   ol: ({ children }) => (
-    <ol className="list-decimal list-inside dark:text-gray-400 text-gray-500 space-y-1.5 mb-4 pl-2">
+    <ol className="list-decimal pl-6 text-gray-700 dark:text-gray-300 space-y-2 mb-6">
       {children}
     </ol>
   ),
 
   li: ({ children }) => (
-    <li className="dark:text-gray-400 text-gray-500 leading-relaxed">
+    <li className="leading-7">
       {children}
     </li>
   ),
 
   blockquote: ({ children }) => (
-    <blockquote className="border-l-2 border-blue-500/50 pl-4 my-4 dark:text-gray-500 text-gray-400 italic">
+    <blockquote className="border-l-4 border-blue-500 pl-5 italic text-gray-500 dark:text-gray-400 my-6">
       {children}
     </blockquote>
   ),
 
-  code: ({ children }) => (
-    <code className="px-1.5 py-0.5 rounded dark:bg-white/[0.06] bg-black/[0.06] dark:border-white/[0.08] border-black/[0.08] border text-blue-500 dark:text-blue-300 text-[0.85em] font-mono">
-      {children}
-    </code>
-  ),
+  code: ({ className, children }) => {
+    if (className) {
+      return (
+        <code className={className}>
+          {children}
+        </code>
+      )
+    }
+
+    return (
+      <code
+        className="
+          px-1.5 py-1
+          rounded-md
+          font-mono
+          text-[0.85em]
+
+          bg-black/[0.05]
+          dark:bg-white/[0.06]
+
+          border
+          border-black/[0.08]
+          dark:border-white/[0.08]
+
+          text-blue-600
+          dark:text-blue-300
+        "
+      >
+        {children}
+      </code>
+    )
+  },
 
   pre: ({ children }) => (
-    <pre className="my-5 p-5 rounded-xl bg-[#0d1117] border border-white/[0.07] overflow-x-auto text-sm font-mono text-gray-300 leading-relaxed">
-      {children}
-    </pre>
+    <div
+      className="
+        my-8
+        overflow-hidden
+        rounded-2xl
+        border
+
+        border-black/[0.08]
+        dark:border-white/[0.08]
+
+        bg-[#f8fafc]
+        dark:bg-[#0b1120]
+
+        shadow-lg
+        dark:shadow-2xl
+      "
+    >
+
+      {/* Top Bar */}
+      <div
+        className="
+          flex items-center justify-between
+          px-4 py-3
+
+          border-b
+
+          border-black/[0.06]
+          dark:border-white/[0.06]
+
+          bg-black/[0.03]
+          dark:bg-white/[0.03]
+        "
+      >
+
+        <div className="flex items-center gap-2">
+          <div className="w-3 h-3 rounded-full bg-red-500" />
+          <div className="w-3 h-3 rounded-full bg-yellow-500" />
+          <div className="w-3 h-3 rounded-full bg-green-500" />
+        </div>
+
+        <span
+          className="
+            text-[11px]
+            uppercase
+            tracking-widest
+            font-medium
+
+            text-gray-500
+            dark:text-gray-400
+          "
+        >
+          code
+        </span>
+      </div>
+
+      {/* Code Content */}
+      <pre
+        className="
+          overflow-x-auto
+          p-5
+          text-[15px]
+          leading-8
+
+          text-gray-800
+          dark:text-gray-200
+
+          bg-transparent
+        "
+      >
+        {children}
+      </pre>
+    </div>
   ),
 
   hr: () => (
-    <hr className="my-8 dark:border-white/[0.07] border-black/[0.07]" />
+    <hr className="my-10 border-black/[0.08] dark:border-white/[0.08]" />
   ),
 
   strong: ({ children }) => (
-    <strong className="font-semibold dark:text-white text-gray-900">
+    <strong className="font-semibold text-gray-900 dark:text-white">
       {children}
     </strong>
   ),
 
   table: ({ children }) => (
-    <div className="overflow-x-auto my-6">
-      <table className="w-full text-sm text-left dark:text-gray-400 text-gray-500 border dark:border-white/[0.07] border-black/[0.07] rounded-xl overflow-hidden">
+    <div className="overflow-x-auto my-8 rounded-2xl border border-black/[0.08] dark:border-white/[0.08]">
+      <table className="w-full text-sm text-left border-collapse">
         {children}
       </table>
     </div>
   ),
 
   th: ({ children }) => (
-    <th className="px-4 py-3 text-xs font-semibold dark:text-gray-300 text-gray-600 uppercase tracking-wider dark:bg-white/[0.04] bg-black/[0.04] border-b dark:border-white/[0.07] border-black/[0.07]">
+    <th
+      className="
+        px-5 py-4
+        text-xs
+        uppercase
+        tracking-wider
+        font-semibold
+
+        bg-black/[0.03]
+        dark:bg-white/[0.04]
+
+        text-gray-700
+        dark:text-gray-300
+
+        border-b
+        border-black/[0.08]
+        dark:border-white/[0.08]
+      "
+    >
       {children}
     </th>
   ),
 
   td: ({ children }) => (
-    <td className="px-4 py-3 border-b dark:border-white/[0.04] border-black/[0.04]">
+    <td
+      className="
+        px-5 py-4
+
+        text-gray-700
+        dark:text-gray-300
+
+        border-b
+        border-black/[0.05]
+        dark:border-white/[0.05]
+      "
+    >
       {children}
     </td>
   ),

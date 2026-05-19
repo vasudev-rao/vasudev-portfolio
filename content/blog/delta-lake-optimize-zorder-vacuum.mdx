@@ -1,0 +1,447 @@
+---
+title: "Delta Lake Optimization: OPTIMIZE, ZORDER, and VACUUM in Production"
+date: "2026-05-19"
+excerpt: "Running Delta Lake without a tuning strategy is how you end up with 400,000 small files, query times that keep climbing, and storage bills you can't explain. Here's exactly how I manage OPTIMIZE, ZORDER, and VACUUM in production."
+tags: ["Data Engineering", "Delta Lake", "Apache Spark", "Databricks", "Storage Optimization", "Architecture"]
+readTime: "14 min read"
+---
+
+# Delta Lake Optimization: OPTIMIZE, ZORDER, and VACUUM in Production
+
+Delta Lake gives you ACID transactions, time travel, and schema enforcement out of the box. What it doesn't give you is a self-tuning storage layer.
+
+Left unmanaged, Delta tables degrade. A table that runs clean queries on day one starts accumulating small files, stale versions, and unnecessary scan overhead over months of writes. The queries slow down. The storage bill climbs. And when someone finally looks at it, there are 400,000 files in a single partition.
+
+I've seen this happen on tables with millions of daily records and on lookup tables that get updated twice a day. The failure mode is the same — nobody set up a maintenance strategy.
+
+Here's how OPTIMIZE, ZORDER, and VACUUM actually work, when to use them, and how I run them in production without breaking things.
+
+## The Core Problem: File Proliferation
+
+Delta Lake writes are append-oriented by default. Every streaming micro-batch, every INSERT, every merge operation produces new Parquet files. Over time:
+
+```
+Day 1:   table/
+           └── part-00001.parquet   (500MB)
+
+Day 30:  table/
+           ├── part-00001.parquet   (500MB)
+           ├── part-00002.parquet   (2MB)    ← micro-batch write
+           ├── part-00003.parquet   (2MB)    ← another micro-batch
+           ├── part-00004.parquet   (450KB)  ← merge residual
+           ├── part-00005.parquet   (1.2MB)
+           ... (40,000 more files)
+```
+
+Spark reads each file with a separate task. 40,000 files means 40,000 tasks, most doing almost no work — just overhead, scheduling, and S3 LIST calls.
+
+This is the small files problem. OPTIMIZE solves it.
+
+## OPTIMIZE: Compaction Without Downtime
+
+OPTIMIZE rewrites small Parquet files into larger ones (target: 1GB each by default) without taking the table offline. Reads continue while it runs.
+
+```sql
+-- Basic compaction — rewrites all small files
+OPTIMIZE delta.`s3://datalake/gold/user_events`;
+
+-- Partition-scoped compaction — more surgical
+OPTIMIZE delta.`s3://datalake/gold/user_events`
+WHERE event_date >= '2026-05-01';
+```
+
+```python
+from delta.tables import DeltaTable
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.appName("maintenance").getOrCreate()
+
+def optimize_table(table_path: str, partition_filter: str = None):
+    dt = DeltaTable.forPath(spark, table_path)
+
+    if partition_filter:
+        dt.optimize().where(partition_filter).executeCompaction()
+    else:
+        dt.optimize().executeCompaction()
+
+    print(f"OPTIMIZE complete: {table_path}")
+```
+
+### What OPTIMIZE Actually Does
+
+It doesn't rewrite the entire table. It:
+
+1. Reads the Delta transaction log to find small files (below `delta.targetFileSize`, default 1GB)
+2. Groups them into batches
+3. Rewrites each batch into a single larger file
+4. Commits the new files to the transaction log atomically
+5. The old files remain on disk until VACUUM removes them
+
+This is important: **OPTIMIZE is non-destructive**. The old files are still there. Time travel still works for the version before the compaction. VACUUM is what actually deletes them.
+
+### The Target File Size Question
+
+1GB is the default. It's not always right.
+
+```python
+# For high-concurrency tables with many small queries
+spark.conf.set("spark.databricks.delta.optimize.maxFileSize", 128 * 1024 * 1024)  # 128MB
+
+# For large analytical tables with full scans
+spark.conf.set("spark.databricks.delta.optimize.maxFileSize", 1024 * 1024 * 1024)  # 1GB (default)
+
+# Rule of thumb:
+# - Low-latency point lookups → smaller files (128-256MB)
+# - Full analytical scans → larger files (512MB-1GB)
+# - Streaming ingestion tables → 256MB (balance freshness and scan efficiency)
+```
+
+## ZORDER: Co-locating Data for Skip Efficiency
+
+Compaction helps with file count. ZORDER helps with which files Spark skips during a query.
+
+Without ZORDER, data is laid out in write order — essentially random relative to your query predicates. With ZORDER, Delta co-locates records with similar values for the specified columns, enabling aggressive file skipping.
+
+```sql
+-- OPTIMIZE + ZORDER in one pass
+OPTIMIZE delta.`s3://datalake/gold/user_events`
+ZORDER BY (user_id, event_date);
+```
+
+```python
+def optimize_with_zorder(table_path: str, zorder_cols: list[str], partition_filter: str = None):
+    dt = DeltaTable.forPath(spark, table_path)
+
+    optimizer = dt.optimize()
+    if partition_filter:
+        optimizer = optimizer.where(partition_filter)
+
+    optimizer.executeZOrderBy(*zorder_cols)
+    print(f"OPTIMIZE ZORDER BY {zorder_cols} complete: {table_path}")
+```
+
+### How File Skipping Works
+
+Each Parquet file stores min/max statistics for each column. When you query `WHERE user_id = 'abc123'`, Spark checks the statistics for every file:
+
+```
+File A: user_id min='aaa001', max='azz999'  → 'abc123' could be here → READ
+File B: user_id min='baa001', max='bzz999'  → 'abc123' can't be here → SKIP
+File C: user_id min='aaa001', max='azz999'  → 'abc123' could be here → READ
+```
+
+Without ZORDER, user IDs are scattered randomly — most files contain the full range, nothing gets skipped. With ZORDER, similar user IDs are co-located, so most files can be safely skipped.
+
+The gain is proportional to your data skew and query selectivity. I've seen ZORDER turn a 45-second query into 4 seconds on the same hardware. I've also seen it do almost nothing on tables where every query is a full scan.
+
+### Choosing ZORDER Columns
+
+```
+Good ZORDER candidates:
+  ✅ High-cardinality columns used in WHERE filters (user_id, order_id, device_id)
+  ✅ Date/time columns if you query specific ranges (event_date, created_at)
+  ✅ Columns appearing in JOIN conditions
+  ✅ Columns used in point lookups
+
+Bad ZORDER candidates:
+  ❌ Low-cardinality columns (status, country, platform) — already handles by partitioning
+  ❌ Columns never used in filters
+  ❌ Columns you're already partitioning by (ZORDER doesn't help within a single partition file)
+  ❌ More than 2-3 columns — effectiveness degrades beyond that
+```
+
+ZORDER effectiveness degrades with every additional column. Two columns is the sweet spot for most production tables. Three is occasionally justified. Beyond that, you're paying the ZORDER cost without proportional benefit.
+
+### ZORDER vs Partitioning
+
+These solve different problems. Don't confuse them.
+
+| | Partitioning | ZORDER |
+|---|---|---|
+| **Mechanism** | Physical directory split | Min/max clustering within files |
+| **Best for** | Low-cardinality, always-filtered columns | High-cardinality, frequently-filtered columns |
+| **Example** | `event_date`, `region`, `platform` | `user_id`, `order_id`, `session_id` |
+| **Cost** | Write overhead, small file risk if wrong | Rewrite cost on OPTIMIZE |
+| **Skipping** | Entire partitions (directories) | Individual files within a partition |
+
+Partition by `event_date`. ZORDER by `user_id`. Never the other way around.
+
+## VACUUM: Cleaning Up What OPTIMIZE Leaves Behind
+
+OPTIMIZE produces new files but doesn't delete old ones. Those old files accumulate and are only useful for time travel. VACUUM removes them.
+
+```sql
+-- Default: removes files older than 7 days
+VACUUM delta.`s3://datalake/gold/user_events`;
+
+-- Custom retention (7 days = 168 hours, minimum recommended)
+VACUUM delta.`s3://datalake/gold/user_events` RETAIN 168 HOURS;
+
+-- DRY RUN first — always
+VACUUM delta.`s3://datalake/gold/user_events` DRY RUN;
+```
+
+```python
+def vacuum_table(table_path: str, retention_hours: int = 168, dry_run: bool = True):
+    dt = DeltaTable.forPath(spark, table_path)
+
+    if dry_run:
+        # Returns list of files that would be deleted
+        files_to_delete = dt.vacuum(retention_hours)
+        print(f"DRY RUN — would delete {files_to_delete.count()} files from {table_path}")
+        return files_to_delete
+
+    dt.vacuum(retention_hours)
+    print(f"VACUUM complete: {table_path} (retention: {retention_hours}h)")
+```
+
+### The Retention Floor
+
+Delta Lake enforces a minimum 7-day retention by default. This protects long-running queries that may still be reading old file versions.
+
+```python
+# If you MUST go below 7 days (not recommended)
+spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled", "false")
+dt.vacuum(24)  # 24-hour retention — dangerous if you have long-running queries
+```
+
+I've never overridden this in production. If your storage costs are severe enough that 7 days of old files is a problem, something else is wrong with your write volume or partitioning strategy.
+
+### What VACUUM Does and Doesn't Delete
+
+```
+VACUUM deletes:
+  ✅ Files no longer referenced by the current transaction log version
+  ✅ Files older than the retention window
+  ✅ Residual files from failed writes (uncommitted)
+
+VACUUM does NOT delete:
+  ❌ The Delta transaction log itself (_delta_log/)
+  ❌ Files still referenced by versions within the retention window
+  ❌ Checkpoint files
+```
+
+After VACUUM, time travel only works back to the retention boundary. This is the tradeoff: storage savings vs. historical query depth.
+
+## My Production Maintenance Strategy
+
+Here's the full pattern I run. Three jobs, scheduled by table tier.
+
+### Job 1: Daily Incremental OPTIMIZE
+
+```python
+from pyspark.sql import SparkSession
+from delta.tables import DeltaTable
+from datetime import datetime, timedelta
+
+def daily_optimize(table_path: str, partition_col: str, zorder_cols: list[str] = None):
+    """
+    Optimize only yesterday's partition — fast, surgical, runs daily.
+    Full table OPTIMIZE runs weekly.
+    """
+    spark = SparkSession.builder.appName("daily-optimize").getOrCreate()
+    yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    dt = DeltaTable.forPath(spark, table_path)
+    optimizer = dt.optimize().where(f"{partition_col} = '{yesterday}'")
+
+    if zorder_cols:
+        optimizer.executeZOrderBy(*zorder_cols)
+    else:
+        optimizer.executeCompaction()
+
+    print(f"Daily OPTIMIZE complete: {table_path} partition={yesterday}")
+```
+
+Daily OPTIMIZE on just the previous partition keeps file counts manageable without touching the full table. A full-table OPTIMIZE on a 10TB table takes hours — you can't do it daily.
+
+### Job 2: Weekly Full OPTIMIZE + ZORDER
+
+```python
+def weekly_optimize(table_path: str, zorder_cols: list[str], lookback_days: int = 30):
+    """
+    Full compaction + ZORDER on recent partitions weekly.
+    Older partitions are already optimized — skip them.
+    """
+    spark = SparkSession.builder.appName("weekly-optimize").getOrCreate()
+    cutoff = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+    dt = DeltaTable.forPath(spark, table_path)
+    (
+        dt.optimize()
+        .where(f"event_date >= '{cutoff}'")
+        .executeZOrderBy(*zorder_cols)
+    )
+
+    print(f"Weekly OPTIMIZE ZORDER complete: {table_path} (last {lookback_days} days)")
+```
+
+### Job 3: Weekly VACUUM
+
+```python
+def weekly_vacuum(table_path: str, retention_hours: int = 168):
+    """
+    Run after OPTIMIZE — always OPTIMIZE before VACUUM, never before.
+    """
+    spark = SparkSession.builder.appName("weekly-vacuum").getOrCreate()
+    dt = DeltaTable.forPath(spark, table_path)
+
+    # Dry run first — log the file count
+    to_delete = dt.vacuum(retention_hours)
+    file_count = to_delete.count()
+    print(f"VACUUM will delete {file_count} files from {table_path}")
+
+    if file_count > 0:
+        dt.vacuum(retention_hours)
+        print(f"VACUUM complete: {table_path}")
+```
+
+### Always OPTIMIZE Before VACUUM
+
+This ordering is non-negotiable:
+
+```
+WRONG:  VACUUM → OPTIMIZE
+         ↳ VACUUM deletes old files, then OPTIMIZE tries to rewrite them → fails
+
+CORRECT: OPTIMIZE → VACUUM
+          ↳ OPTIMIZE produces new compacted files, VACUUM removes the old ones
+```
+
+### Scheduling by Table Tier
+
+```
+Gold tables (BI-facing, SLA-bound):
+  Daily OPTIMIZE   → every day at 02:00 UTC
+  Weekly OPTIMIZE  → every Sunday at 03:00 UTC
+  Weekly VACUUM    → every Sunday at 05:00 UTC (after OPTIMIZE completes)
+
+Silver tables (intermediate transforms):
+  Twice-weekly OPTIMIZE → Tuesday/Friday
+  Biweekly VACUUM       → every other week
+
+Bronze tables (raw ingestion):
+  Weekly OPTIMIZE  → Sundays
+  Monthly VACUUM   → first Sunday of each month
+  (Bronze is append-only; file proliferation is slower)
+```
+
+## Measuring Whether It's Working
+
+Before you run OPTIMIZE, check the current state:
+
+```python
+def diagnose_table(table_path: str):
+    """
+    Inspect file count, size distribution, and skew before optimizing.
+    """
+    spark = SparkSession.builder.appName("diagnose").getOrCreate()
+
+    detail = spark.sql(f"DESCRIBE DETAIL delta.`{table_path}`")
+    detail.select("numFiles", "sizeInBytes").show()
+
+    # File size distribution
+    files_df = spark.sql(f"""
+        SELECT
+            COUNT(*) AS total_files,
+            SUM(size) / 1e9 AS total_size_gb,
+            AVG(size) / 1e6 AS avg_file_size_mb,
+            MIN(size) / 1e3 AS min_file_size_kb,
+            MAX(size) / 1e6 AS max_file_size_mb,
+            COUNT(CASE WHEN size < 10 * 1024 * 1024 THEN 1 END) AS files_under_10mb,
+            COUNT(CASE WHEN size < 1  * 1024 * 1024 THEN 1 END) AS files_under_1mb
+        FROM (
+            SELECT explode(files.size) AS size
+            FROM (SELECT input_file_name() AS path, * FROM delta.`{table_path}` LIMIT 0)
+        )
+    """)
+
+    # Simpler: use Delta history
+    history = spark.sql(f"DESCRIBE HISTORY delta.`{table_path}` LIMIT 5")
+    history.select("version", "timestamp", "operation", "operationMetrics").show(truncate=False)
+```
+
+After OPTIMIZE, the `operationMetrics` in the Delta history tells you exactly what happened:
+
+```json
+{
+  "numFilesAdded": "12",
+  "numFilesRemoved": "8420",
+  "filesAdded": {"avg": "890MB", "max": "1.02GB", "min": "450MB"},
+  "filesRemoved": {"avg": "2.1MB", "max": "45MB", "min": "128KB"},
+  "partitionsOptimized": "30"
+}
+```
+
+8,420 files collapsed into 12. That's what a healthy OPTIMIZE looks like.
+
+## Real Conversation I've Had
+
+> **Engineer:** "Queries on this table went from 8 seconds to 90 seconds over the last month. We didn't change anything."
+>
+> **Me:** "When did anyone last run OPTIMIZE on it?"
+>
+> **Engineer:** "... we have OPTIMIZE?"
+>
+> **Me:** "How many files does it have?"
+>
+> **Engineer:** "Let me check. 240,000."
+>
+> **Me:** "There's your problem. It should have ~200."
+
+Ran OPTIMIZE + ZORDER. Queries dropped back to 6 seconds. Added it to the maintenance schedule. Two hours of work, two months of pain avoided.
+
+## Common Pitfalls
+
+❌ **Running VACUUM before OPTIMIZE** — VACUUM deletes files that OPTIMIZE needs to read for compaction. Always OPTIMIZE first, VACUUM second.
+
+❌ **ZORDERing on partition columns** — If you partition by `event_date`, ZORDER on `event_date` does nothing. The data is already split by that column. Waste of compute.
+
+❌ **ZORDER on 5+ columns** — The algorithm's effectiveness degrades quickly. Two columns is the sweet spot. Three is occasionally right. Five is cargo-culting.
+
+❌ **Never running OPTIMIZE on Bronze tables** — Bronze gets the same small-file problem as Silver and Gold. It just happens more slowly. Monthly compaction is fine, but zero compaction isn't.
+
+❌ **Setting retention below 7 days in production** — Long-running analytical queries, concurrent readers, and snapshot isolation all depend on old file versions being present. Don't touch the retention floor without understanding your longest-running queries.
+
+❌ **Full-table OPTIMIZE daily on large tables** — A 10TB table with full OPTIMIZE takes hours and costs real money. Use partition-scoped daily OPTIMIZE and reserve full compaction for the weekly run.
+
+❌ **Not scheduling VACUUM at all** — OPTIMIZE without VACUUM is like reorganizing your desk without throwing anything away. Storage costs grow, old versions accumulate, and the Delta log keeps references to files that serve no purpose.
+
+## Production Checklist
+
+✅ **Table health check:**
+- File count per partition is in the hundreds, not tens of thousands
+- Average file size is between 128MB and 1GB
+- No partition has files below 1MB at scale (indicates streaming micro-batches not being compacted)
+
+✅ **OPTIMIZE configuration:**
+- Target file size matches query pattern (128MB for point lookups, 1GB for full scans)
+- Daily job scoped to recent partitions only
+- Weekly full job covers last 30 days
+- ZORDER columns limited to 1-2 high-cardinality filter columns
+
+✅ **VACUUM configuration:**
+- Runs after OPTIMIZE completes (never before)
+- Retention set to 168+ hours (7 days minimum)
+- Dry run output logged before destructive run
+- Time travel requirements documented — retention window must exceed longest expected historical query
+
+✅ **Monitoring:**
+- Delta history checked after each OPTIMIZE for `numFilesRemoved`
+- Query execution plans inspected for `filesSkipped` metric (ZORDER effectiveness)
+- Weekly file count trend tracked — if it keeps climbing, compaction is losing the race
+
+## Key Takeaways
+
+1. **Delta tables degrade by default** — file proliferation is not an edge case, it's what happens when writes accumulate without maintenance
+2. **OPTIMIZE and VACUUM are separate concerns** — compaction and deletion are decoupled by design; always run OPTIMIZE before VACUUM
+3. **ZORDER is not magic** — it helps with selective queries on high-cardinality columns; it does nothing for full scans or low-cardinality predicates
+4. **Scope your OPTIMIZE jobs** — daily compaction on recent partitions, weekly full compaction with ZORDER; never full-table daily on anything over 1TB
+5. **The retention floor exists for a reason** — 7 days protects concurrent readers and long-running queries; don't disable it without understanding the consequences
+6. **Measure before and after** — `DESCRIBE HISTORY` and `numFilesRemoved` tell you whether OPTIMIZE is actually winning the file count battle
+
+A Delta table that's properly maintained is one of the most operationally pleasant storage layers you can run. A Delta table that's never been tuned is a slow-motion reliability incident.
+
+---
+
+**Related:** [Batch vs Streaming: How I Decide in Real-World Data Systems](/blog/batch-vs-streaming-how-i-decide) | [Building Fault-Tolerant Kafka Pipelines](/blog/fault-tolerant-kafka) | [Data Quality & Observability in Data Pipelines](/blog/data-quality-observability-pipelines)

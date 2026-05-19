@@ -1,0 +1,611 @@
+---
+title: "Delta Lake Optimization: OPTIMIZE, ZORDER, Liquid Clustering, and VACUUM in Production"
+date: "2026-05-19"
+excerpt: "Delta Lake doesn't maintain itself. Here's the compaction, clustering, and cleanup strategy I run in production — and when to drop ZORDER for Liquid Clustering."
+tags: ["Data Engineering", "Delta Lake", "Apache Spark", "Databricks", "Liquid Clustering", "Storage Optimization", "Architecture"]
+readTime: "18 min read"
+---
+
+# Delta Lake Optimization: OPTIMIZE, ZORDER, Liquid Clustering, and VACUUM in Production
+
+Every few months, someone on the team notices that a table that used to be fast is now slow. Nobody changed the query. Nobody changed the schema. The data just kept arriving and nobody ran maintenance.
+
+Delta Lake doesn't tune itself. Every write — every streaming micro-batch, every MERGE, every INSERT — produces new Parquet files. Over weeks those files accumulate. Spark ends up scheduling thousands of tasks to read data that could fit in a dozen files. Queries that ran in 8 seconds now run in 90.
+
+The fix is not a bigger cluster. It's a maintenance strategy.
+
+Here's how OPTIMIZE, ZORDER, Liquid Clustering, and VACUUM actually work, when each one belongs in your system, and how I run them in production without breaking things.
+
+## The Core Tradeoff
+
+Before any strategy, understand what each tool is actually doing:
+
+| Tool | Solves | Doesn't Solve |
+|------|--------|---------------|
+| **OPTIMIZE** | Too many small files | Which files to skip |
+| **ZORDER** | File skip efficiency for stable query patterns | Re-clustering when patterns change |
+| **Liquid Clustering** | File skip efficiency + adaptive re-clustering | Tables on old Delta versions |
+| **VACUUM** | Stale file accumulation and storage cost | Anything while files are still needed |
+
+OPTIMIZE handles file count. ZORDER and Liquid Clustering handle file layout. VACUUM handles cleanup. They're separate concerns. Teams that confuse them end up running VACUUM on tables that have never been compacted, or ZORDERing on partition columns, or skipping VACUUM entirely until S3 costs become a line item in a board meeting.
+
+## The 4 Questions I Ask First
+
+### 1. How bad is the file count right now?
+
+Before touching anything, check the actual state of the table.
+
+```python
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.appName("diagnose").getOrCreate()
+
+def diagnose_table(table_path: str):
+    # File count and total size
+    detail = spark.sql(f"DESCRIBE DETAIL delta.`{table_path}`")
+    detail.select("numFiles", "sizeInBytes", "clusteringColumns").show()
+
+    # Recent history — what operations have run and what they did
+    spark.sql(f"""
+        DESCRIBE HISTORY delta.`{table_path}` LIMIT 10
+    """).select("version", "timestamp", "operation", "operationMetrics").show(truncate=False)
+```
+
+```
+# Healthy table (1TB, ~1000 files, ~1GB average)
+numFiles: 987       sizeInBytes: 1,043,741,824,000
+
+# Unhealthy table (same data, never compacted)
+numFiles: 241,830   sizeInBytes: 1,043,741,824,000
+```
+
+241,830 tasks. Most doing kilobytes of work. This is how an 8-second query becomes 90 seconds.
+
+### 2. What are the actual query patterns?
+
+OPTIMIZE without ZORDER compacts files but doesn't help Spark skip them. To get skip efficiency, you need to know which columns queries filter on.
+
+```
+Queries filter on user_id and event_date?
+→ ZORDER BY (user_id, event_date)
+→ OR Liquid Clustering on (user_id, event_date)
+
+Queries are mostly full scans with no selective filters?
+→ OPTIMIZE alone — ZORDER buys you nothing here
+
+Query patterns change every quarter?
+→ Liquid Clustering — changing ZORDER means a full table rewrite
+```
+
+### 3. Is this a new table or an existing one?
+
+This determines whether Liquid Clustering is an option or a migration project.
+
+```
+New table on Delta 3.1+ / DBR 13.3+?
+→ Start with Liquid Clustering
+→ Skip explicit partitioning and ZORDER entirely
+
+Existing table, heavily partitioned, stable access pattern?
+→ Keep ZORDER — migration cost rarely justifies the switch
+
+Existing table, access patterns actively changing?
+→ Plan the migration to Liquid Clustering
+→ Requires full table recreation — schedule accordingly
+```
+
+### 4. When did VACUUM last run?
+
+If the answer is "never" or "I don't know," the table has months of stale files. Run a dry run before anything else.
+
+```sql
+-- See what would be deleted without doing it
+VACUUM delta.`s3://datalake/gold/user_events` DRY RUN;
+```
+
+```python
+def vacuum_dry_run(table_path: str, retention_hours: int = 168):
+    dt = DeltaTable.forPath(spark, table_path)
+    files_to_delete = dt.vacuum(retention_hours)
+    print(f"DRY RUN: {files_to_delete.count()} files would be removed from {table_path}")
+    return files_to_delete
+```
+
+## My Decision Framework
+
+```
+Is this table on Delta 3.1+ / DBR 13.3+?
+    │
+    ├── NO  → Use OPTIMIZE + ZORDER
+    │         Partition by low-cardinality columns (event_date, region)
+    │         ZORDER by high-cardinality filter columns (user_id, order_id)
+    │         Run on a schedule — it won't maintain itself
+    │
+    └── YES → Is this a new table?
+                  │
+                  ├── YES → Use Liquid Clustering
+                  │         CLUSTER BY (user_id, event_date)
+                  │         No PARTITIONED BY clause — Liquid replaces it
+                  │         OPTIMIZE handles the rest automatically
+                  │
+                  └── NO  → Are access patterns stable?
+                                │
+                                ├── YES → Keep ZORDER
+                                │         Migration cost exceeds benefit
+                                │         Re-evaluate if patterns shift
+                                │
+                                └── NO  → Migrate to Liquid Clustering
+                                          Recreate table without partition clause
+                                          Backfill with OPTIMIZE
+                                          Clustering happens incrementally
+```
+
+## OPTIMIZE: Compaction Without Downtime
+
+OPTIMIZE rewrites small Parquet files into larger ones — default target 1GB — without taking the table offline. Reads continue while it runs.
+
+```sql
+-- Compact the full table
+OPTIMIZE delta.`s3://datalake/gold/user_events`;
+
+-- Surgical: compact only recent partitions
+OPTIMIZE delta.`s3://datalake/gold/user_events`
+WHERE event_date >= '2026-05-01';
+```
+
+```python
+from delta.tables import DeltaTable
+
+def optimize_table(table_path: str, partition_filter: str = None):
+    dt = DeltaTable.forPath(spark, table_path)
+
+    if partition_filter:
+        dt.optimize().where(partition_filter).executeCompaction()
+    else:
+        dt.optimize().executeCompaction()
+
+    print(f"OPTIMIZE complete: {table_path}")
+```
+
+OPTIMIZE is non-destructive. Old files stay on disk after it runs — that's intentional, time travel still works across the compaction boundary. VACUUM is what actually deletes them. Run OPTIMIZE before VACUUM, never after.
+
+### The File Size Question
+
+1GB is the default. It's not always right.
+
+```python
+# Point lookups, high-concurrency tables
+spark.conf.set("spark.databricks.delta.optimize.maxFileSize", 128 * 1024 * 1024)   # 128MB
+
+# Full analytical scans
+spark.conf.set("spark.databricks.delta.optimize.maxFileSize", 1024 * 1024 * 1024)  # 1GB
+
+# Streaming ingestion tables — balance freshness with scan efficiency
+spark.conf.set("spark.databricks.delta.optimize.maxFileSize", 256 * 1024 * 1024)   # 256MB
+```
+
+## ZORDER: Layout for Skip Efficiency
+
+Compaction reduces file count. ZORDER controls which files get skipped.
+
+Each Parquet file stores min/max statistics per column. When Spark executes `WHERE user_id = 'abc123'`, it checks every file's statistics and skips files where the value can't possibly exist. Without ZORDER, user IDs are scattered across all files in write order — nothing gets skipped. With ZORDER, similar user IDs are co-located — most files get skipped.
+
+```sql
+-- OPTIMIZE and ZORDER in one pass
+OPTIMIZE delta.`s3://datalake/gold/user_events`
+ZORDER BY (user_id, event_date);
+```
+
+```python
+def optimize_with_zorder(table_path: str, zorder_cols: list[str], partition_filter: str = None):
+    dt = DeltaTable.forPath(spark, table_path)
+
+    optimizer = dt.optimize()
+    if partition_filter:
+        optimizer = optimizer.where(partition_filter)
+
+    optimizer.executeZOrderBy(*zorder_cols)
+    print(f"OPTIMIZE ZORDER BY {zorder_cols} complete: {table_path}")
+```
+
+I've seen ZORDER turn a 45-second query into 4 seconds on the same cluster. I've also seen it do nothing on tables where every query is a full scan. The gain is proportional to query selectivity.
+
+### Choosing ZORDER Columns
+
+```
+Good candidates:
+  ✅ High-cardinality filter columns — user_id, order_id, device_id, session_id
+  ✅ Date/time columns used in range filters — event_date, created_at
+  ✅ Columns in JOIN conditions
+
+Bad candidates:
+  ❌ Low-cardinality columns — status, country, platform (use partitioning instead)
+  ❌ Columns you're already partitioning by — ZORDER can't help within a single-file partition
+  ❌ More than 2-3 columns — effectiveness degrades fast beyond that
+```
+
+ZORDER on 2 columns is usually the sweet spot. Three is occasionally justified. Beyond that you're paying the rewrite cost without proportional benefit.
+
+### ZORDER vs Partitioning
+
+These are complementary, not interchangeable.
+
+| | Partitioning | ZORDER |
+|---|---|---|
+| **Mechanism** | Physical directory split | Min/max clustering within files |
+| **Best for** | Low-cardinality, always-filtered columns | High-cardinality, frequently-filtered columns |
+| **Example** | `event_date`, `region`, `platform` | `user_id`, `order_id`, `session_id` |
+| **Skipping scope** | Entire partitions | Individual files within a partition |
+| **Cost of change** | Requires table recreation | Full rewrite on next OPTIMIZE |
+
+Partition by `event_date`. ZORDER by `user_id`. Never the other way around.
+
+## Liquid Clustering: What ZORDER Should Have Been
+
+ZORDER works. I've run it in production for years. But its limitations become painful as tables mature:
+
+- Changing query patterns means a full table rewrite — teams don't bother, and the clustering rots
+- Effectiveness collapses past 2–3 columns
+- Tied to your partitioning scheme — wrong partition granularity and ZORDER buys almost nothing
+- Every write degrades clustering; you have to OPTIMIZE to restore it, and OPTIMIZE rewrites everything each time
+
+Liquid Clustering, available in Delta Lake 3.1 and Databricks Runtime 13.3+, replaces the ZORDER-on-OPTIMIZE model with an incremental approach. It tracks which files need re-clustering using a **clustering score** in the transaction log. OPTIMIZE on a liquid-clustered table rewrites only files below the clustering threshold — not the whole table.
+
+The practical result: after the initial clustering pass, ongoing OPTIMIZE runs are significantly faster and cheaper than the ZORDER equivalent.
+
+### Enabling Liquid Clustering
+
+```sql
+-- New table
+CREATE TABLE user_events
+CLUSTER BY (user_id, event_date)
+USING DELTA
+LOCATION 's3://datalake/gold/user_events';
+
+-- Existing table
+ALTER TABLE delta.`s3://datalake/gold/user_events`
+CLUSTER BY (user_id, event_date);
+
+-- Run clustering — no ZORDER keyword needed
+OPTIMIZE delta.`s3://datalake/gold/user_events`;
+```
+
+```python
+def enable_liquid_clustering(table_path: str, cluster_cols: list[str]):
+    cols = ", ".join(cluster_cols)
+    spark.sql(f"ALTER TABLE delta.`{table_path}` CLUSTER BY ({cols})")
+    print(f"Liquid Clustering enabled: {table_path} → ({cols})")
+
+def run_liquid_optimize(table_path: str):
+    """
+    No ZORDER keyword. Clustering strategy is defined at the table level.
+    Delta tracks the clustering score and rewrites only what's needed.
+    """
+    DeltaTable.forPath(spark, table_path).optimize().executeCompaction()
+    print(f"Liquid OPTIMIZE complete: {table_path}")
+```
+
+### Changing Clustering Columns Without a Full Rewrite
+
+This is the biggest operational win. With ZORDER, a strategy change means a full table rewrite — painful on anything over a few TB, so teams just don't do it. With Liquid Clustering:
+
+```sql
+-- Access patterns shifted — users now filter on campaign_id, not user_id
+ALTER TABLE delta.`s3://datalake/gold/user_events`
+CLUSTER BY (campaign_id, event_date);
+
+-- Next OPTIMIZE incrementally re-clusters only affected files
+-- No full table rewrite. Table stays queryable throughout.
+OPTIMIZE delta.`s3://datalake/gold/user_events`;
+```
+
+The re-clustering happens across several OPTIMIZE runs, not instantly. But you're not paying the full cost upfront, and nothing goes offline.
+
+### Don't Mix Partitioning with Liquid Clustering
+
+Liquid Clustering is designed to replace explicit partitioning on Delta tables, not layer on top of it.
+
+```sql
+-- WRONG — creates a confused layout, eliminates most of the benefit
+CREATE TABLE user_events
+PARTITIONED BY (event_date)
+CLUSTER BY (user_id)
+USING DELTA;
+
+-- RIGHT — Liquid Clustering handles the physical layout internally
+CREATE TABLE user_events
+CLUSTER BY (user_id, event_date)
+USING DELTA;
+```
+
+If you're migrating a partitioned table, you have to recreate it without the partition clause and backfill. There's no in-place migration. That's the main friction — plan for it.
+
+### Column Limits
+
+Liquid Clustering handles multi-column clustering better than ZORDER by design. But there's still a practical ceiling.
+
+```
+1–2 columns  → Excellent — max file skipping, fast incremental OPTIMIZE
+3–4 columns  → Good — slight overhead, still effective
+5+ columns   → Diminishing returns — clustering score degrades,
+               OPTIMIZE rewrites more than needed
+```
+
+Four columns is the practical maximum. More than that and you're optimizing for query patterns that don't exist at the frequency you think.
+
+### ZORDER vs Liquid Clustering
+
+| | ZORDER | Liquid Clustering |
+|---|---|---|
+| **Delta version** | All versions | Delta 3.1+ / DBR 13.3+ |
+| **Replaces partitioning** | No — works alongside it | Yes — replaces it |
+| **Effective column limit** | 2–3 | 3–4 |
+| **Changing strategy** | Full table rewrite | Incremental, online |
+| **OPTIMIZE cost** | Full rewrite every run | Incremental — only unclustered files |
+| **Best for** | Stable patterns, legacy tables | Evolving patterns, new tables |
+
+For new tables on a modern runtime, Liquid Clustering is the right default. For mature ZORDER tables with stable patterns, the migration rarely justifies the cost — unless your OPTIMIZE jobs are taking hours or your access patterns are actively changing.
+
+## VACUUM: Cleaning Up What OPTIMIZE Leaves Behind
+
+OPTIMIZE produces new compacted files but never deletes the old ones. The old files are only useful for time travel. VACUUM removes them.
+
+```sql
+-- Default: removes files older than 7 days
+VACUUM delta.`s3://datalake/gold/user_events`;
+
+-- Explicit retention
+VACUUM delta.`s3://datalake/gold/user_events` RETAIN 168 HOURS;
+
+-- Always dry run first
+VACUUM delta.`s3://datalake/gold/user_events` DRY RUN;
+```
+
+```python
+def vacuum_table(table_path: str, retention_hours: int = 168, dry_run: bool = True):
+    dt = DeltaTable.forPath(spark, table_path)
+
+    if dry_run:
+        files = dt.vacuum(retention_hours)
+        print(f"DRY RUN — would delete {files.count()} files from {table_path}")
+        return files
+
+    dt.vacuum(retention_hours)
+    print(f"VACUUM complete: {table_path} (retention: {retention_hours}h)")
+```
+
+### The Retention Floor
+
+Delta Lake enforces a 7-day minimum by default. It exists to protect concurrent readers and long-running queries that may still be referencing old file versions.
+
+```python
+# Overriding the floor — not recommended
+spark.conf.set("spark.databricks.delta.retentionDurationCheck.enabled", "false")
+dt.vacuum(24)  # 24h retention — dangerous without knowing your longest-running queries
+```
+
+I've never touched this in production. If 7 days of stale files is causing storage problems, the write volume or partitioning strategy is the real issue.
+
+### What VACUUM Touches and What It Doesn't
+
+```
+VACUUM deletes:
+  ✅ Files older than the retention window, no longer in the transaction log
+  ✅ Residual files from failed or uncommitted writes
+
+VACUUM does NOT delete:
+  ❌ The Delta transaction log (_delta_log/)
+  ❌ Files referenced by any version within the retention window
+  ❌ Checkpoint files
+```
+
+After VACUUM runs, time travel is bounded by the retention window. That's the tradeoff — storage savings in exchange for a shorter historical query horizon.
+
+## My Production Maintenance Strategy
+
+Three jobs. Same structure whether the table uses ZORDER or Liquid Clustering.
+
+### Job 1: Daily Incremental OPTIMIZE
+
+```python
+from datetime import datetime, timedelta
+
+def daily_optimize(
+    table_path: str,
+    partition_col: str = None,
+    zorder_cols: list[str] = None,
+    liquid_clustered: bool = False,
+):
+    dt = DeltaTable.forPath(spark, table_path)
+
+    if liquid_clustered:
+        # Delta tracks clustering score internally
+        # Only unclustered files get rewritten — no partition scope needed
+        dt.optimize().executeCompaction()
+    else:
+        yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+        optimizer = dt.optimize().where(f"{partition_col} = '{yesterday}'")
+        if zorder_cols:
+            optimizer.executeZOrderBy(*zorder_cols)
+        else:
+            optimizer.executeCompaction()
+
+    print(f"Daily OPTIMIZE complete: {table_path}")
+```
+
+For ZORDER tables, scope daily OPTIMIZE to the previous partition only — full-table OPTIMIZE on a 10TB table takes hours. For Liquid Clustered tables, daily OPTIMIZE is cheap enough to run unscoped because it only rewrites what's below the clustering threshold.
+
+### Job 2: Weekly Full OPTIMIZE
+
+```python
+def weekly_optimize(
+    table_path: str,
+    zorder_cols: list[str] = None,
+    liquid_clustered: bool = False,
+    lookback_days: int = 30,
+):
+    dt = DeltaTable.forPath(spark, table_path)
+
+    if liquid_clustered:
+        dt.optimize().executeCompaction()
+        print(f"Weekly Liquid OPTIMIZE complete: {table_path}")
+    else:
+        cutoff = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        (
+            dt.optimize()
+            .where(f"event_date >= '{cutoff}'")
+            .executeZOrderBy(*zorder_cols)
+        )
+        print(f"Weekly OPTIMIZE ZORDER complete: {table_path} (last {lookback_days} days)")
+```
+
+### Job 3: Weekly VACUUM
+
+```python
+def weekly_vacuum(table_path: str, retention_hours: int = 168):
+    """
+    Always runs after OPTIMIZE. Never before.
+    VACUUM → OPTIMIZE fails. OPTIMIZE → VACUUM is correct.
+    """
+    dt = DeltaTable.forPath(spark, table_path)
+
+    count = dt.vacuum(retention_hours).count()
+    print(f"VACUUM will delete {count} files from {table_path}")
+
+    if count > 0:
+        dt.vacuum(retention_hours)
+        print(f"VACUUM complete: {table_path}")
+```
+
+### Scheduling by Table Tier
+
+```
+Gold tables (BI-facing, SLA-bound):
+  Daily OPTIMIZE   → 02:00 UTC daily
+  Weekly OPTIMIZE  → 03:00 UTC Sunday
+  Weekly VACUUM    → 05:00 UTC Sunday (after OPTIMIZE finishes)
+
+Silver tables (intermediate transforms):
+  Twice-weekly OPTIMIZE → Tuesday / Friday
+  Biweekly VACUUM
+
+Bronze tables (raw ingestion, append-only):
+  Weekly OPTIMIZE  → Sunday
+  Monthly VACUUM   → first Sunday of each month
+```
+
+## Measuring Whether It's Working
+
+OPTIMIZE writes its results to the Delta transaction log. The `operationMetrics` after each run tells you exactly what happened.
+
+```python
+def check_last_optimize(table_path: str):
+    spark.sql(f"""
+        SELECT version, timestamp, operationMetrics
+        FROM (DESCRIBE HISTORY delta.`{table_path}`)
+        WHERE operation = 'OPTIMIZE'
+        LIMIT 1
+    """).show(truncate=False)
+```
+
+```json
+// ZORDER table — healthy compaction
+{
+  "numFilesAdded": "12",
+  "numFilesRemoved": "8420",
+  "filesAdded":   {"avg": "890MB", "max": "1.02GB", "min": "450MB"},
+  "filesRemoved": {"avg": "2.1MB",  "max": "45MB",  "min": "128KB"}
+}
+
+// Liquid Clustered table — incremental pass, smaller rewrite
+{
+  "numFilesAdded": "3",
+  "numFilesRemoved": "140",
+  "filesAdded":   {"avg": "920MB", "max": "1.01GB", "min": "780MB"},
+  "filesRemoved": {"avg": "4.1MB",  "max": "22MB",  "min": "512KB"},
+  "clusteringScore": "0.98"
+}
+```
+
+8,420 files collapsed into 12 — that's what a healthy OPTIMIZE looks like on a neglected table. A `clusteringScore` of 0.95+ means the Liquid Clustered table is in good shape. Below 0.7 and the next OPTIMIZE will do significant work.
+
+If `numFilesRemoved` stays high every week, compaction is losing the race with your write volume. The fix is either more frequent OPTIMIZE runs or a rethink of your partitioning strategy.
+
+## Real Conversation I've Had
+
+> **Engineer:** "Queries on this table went from 8 seconds to 90 seconds. We didn't change anything."
+>
+> **Me:** "When did anyone last run OPTIMIZE on it?"
+>
+> **Engineer:** "... we have OPTIMIZE?"
+>
+> **Me:** "How many files does it have?"
+>
+> **Engineer:** "240,000."
+>
+> **Me:** "It should have about 200. Run OPTIMIZE with ZORDER on user_id and event_date. Then set up a daily job so we don't have this conversation again."
+
+Ran OPTIMIZE + ZORDER. Queries dropped to 6 seconds. Added it to the maintenance schedule. Two hours of work, two months of pain avoided.
+
+Six months later:
+
+> **Engineer:** "Marketing changed their dashboards. They filter on campaign_id now. ZORDER on user_id is useless for them."
+>
+> **Me:** "What runtime are you on?"
+>
+> **Engineer:** "DBR 14.2."
+>
+> **Me:** "Recreate the table with Liquid Clustering on campaign_id and event_date. Yes, it's a migration. But the next time access patterns change, you just ALTER TABLE — no migration."
+
+That's the real reason to move to Liquid Clustering. Not because it's newer. Because on a ZORDER table, changing the clustering strategy is expensive enough that teams just don't do it — and slowly the clustering rots while query performance drifts back toward where it started.
+
+## Common Pitfalls
+
+❌ **Running VACUUM before OPTIMIZE** — VACUUM deletes files that OPTIMIZE needs to read; the order matters and it's always OPTIMIZE first  
+❌ **ZORDERing on partition columns** — if you partition by `event_date`, ZORDERing on `event_date` does nothing; the data is already split by that column  
+❌ **ZORDER on 5+ columns** — effectiveness degrades fast; two is the sweet spot, five is cargo-culting  
+❌ **Mixing `PARTITIONED BY` with Liquid Clustering** — they're not additive; Liquid Clustering replaces partitioning, not supplements it  
+❌ **Expecting instant re-clustering after an ALTER TABLE** — re-clustering after `CLUSTER BY` changes is incremental across OPTIMIZE runs, not immediate  
+❌ **Full-table OPTIMIZE daily on large tables** — a 10TB table takes hours; scope daily jobs to recent partitions and save full compaction for weekly  
+❌ **Skipping VACUUM entirely** — OPTIMIZE without VACUUM is reorganizing your desk without throwing anything away; stale files keep accumulating  
+❌ **No Bronze maintenance** — Bronze gets the same small-file problem as Gold, just more slowly; monthly compaction is enough, zero is not  
+
+## Production Checklist
+
+✅ **Before running OPTIMIZE:**
+- File count per partition is checked — anything over 10,000 files per partition needs immediate attention
+- Average file size is below 128MB — if it is, compaction is overdue
+- Query patterns are documented — know which columns to ZORDER or cluster by before running
+
+✅ **OPTIMIZE + ZORDER:**
+- Daily job scoped to previous partition only
+- Weekly full job covers last 30 days
+- ZORDER columns are 1–2 high-cardinality filter columns, not partition columns
+- `numFilesRemoved` is logged after every run
+
+✅ **Liquid Clustering:**
+- No `PARTITIONED BY` clause on the table
+- Clustering columns are 2–4 high-cardinality filter columns
+- `clusteringScore` is checked weekly — target ≥ 0.90
+- Migration plan is documented if converting from ZORDER: recreate, backfill, validate, cut over
+
+✅ **VACUUM:**
+- Dry run output logged before every destructive run
+- Runs after OPTIMIZE, never before
+- Retention is 168+ hours (7-day minimum)
+- Time travel requirements are documented — retention window must exceed longest expected historical query
+
+## Key Takeaways
+
+1. **Delta tables degrade by default** — file proliferation is not an edge case, it's what always happens when writes accumulate without maintenance
+2. **OPTIMIZE and VACUUM are separate jobs** — compaction and deletion are decoupled by design; the order matters and it's always OPTIMIZE first
+3. **ZORDER works until access patterns change** — when they do, changing strategy means a full table rewrite; teams avoid it, clustering rots
+4. **Liquid Clustering is the right default for new tables** — incremental re-clustering, adaptive strategy changes, no manual partition tuning
+5. **Liquid Clustering replaces partitioning, not complements it** — don't combine `PARTITIONED BY` with `CLUSTER BY`
+6. **Measure with `operationMetrics`** — `numFilesRemoved` and `clusteringScore` tell you whether maintenance is winning or losing
+
+The best Delta table is the one nobody is thinking about — because it's fast, the files are tidy, and the maintenance job has been running quietly on a schedule for months.
+
+---
+
+**Related:** [Batch vs Streaming: How I Decide in Real-World Data Systems](/blog/batch-vs-streaming-how-i-decide) | [Building Fault-Tolerant Kafka Pipelines](/blog/fault-tolerant-kafka) | [Data Quality & Observability in Data Pipelines](/blog/data-quality-observability-pipelines)

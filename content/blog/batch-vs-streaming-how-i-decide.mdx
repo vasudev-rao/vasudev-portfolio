@@ -1,0 +1,476 @@
+---
+title: "Batch vs Streaming: How I Decide in Real-World Data Systems"
+date: "2026-05-01"
+excerpt: "Not every pipeline needs Kafka and Spark Streaming. Here's the decision framework I use in production to choose between batch and streaming — and why getting it wrong is expensive."
+tags: ["Data Engineering", "Batch Processing", "Streaming", "Apache Kafka", "Spark", "Architecture"]
+readTime: "13 min read"
+---
+
+# Batch vs Streaming: How I Decide in Real-World Data Systems
+
+Every few months, someone on the team proposes replacing our batch jobs with streaming. Sometimes they're right. Often they're not.
+
+Streaming is not an upgrade from batch. It's a different tool with different costs, different failure modes, and different operational burden. After building both in production — pipelines processing hundreds of millions of events daily and batch jobs crunching terabytes of historical data — I've developed a framework for deciding which one actually belongs in your system.
+
+Here's how I think about it.
+
+## The Core Tradeoff
+
+Before any decision framework, internalize this:
+
+| Dimension | Batch | Streaming |
+|-----------|-------|-----------|
+| **Latency** | Minutes to hours | Seconds to minutes |
+| **Throughput** | Very high | High (with tuning) |
+| **Complexity** | Low | High |
+| **Cost** | Lower | Higher |
+| **Fault tolerance** | Simpler (re-run the job) | Complex (checkpoints, offsets) |
+| **Exactly-once** | Easy | Hard |
+| **Late data handling** | Natural (just re-run) | Requires watermarking |
+| **Operational burden** | Low | High |
+
+Streaming solves one problem: **latency**. If latency isn't your problem, batch is almost always the right answer.
+
+## The 5 Questions I Ask First
+
+### 1. What is the actual latency requirement?
+
+This is the most important question and the one teams answer least honestly.
+
+```
+"We need real-time data"
+→ What does real-time mean to your stakeholders?
+→ "Within the hour" → Batch (micro-batch at worst)
+→ "Within 5 minutes" → Micro-batch or streaming
+→ "Within 30 seconds" → Streaming
+→ "Under 5 seconds" → Streaming with careful tuning
+```
+
+I have never seen a business intelligence dashboard that actually required sub-minute latency. Finance reconciliation, marketing attribution, product analytics — all of these work fine with 15–60 minute batch jobs. The "we need real-time" request is almost always a proxy for "our current pipeline is 6 hours late and unreliable."
+
+Fix the reliability first. Then reassess latency.
+
+### 2. Does the computation require state across events?
+
+Some computations are naturally stateless — transform each record independently. Others require remembering previous records.
+
+```python
+# Stateless — trivially parallelizable, batch is perfect
+def enrich_event(event: dict) -> dict:
+    return {
+        **event,
+        "user_tier": lookup_user_tier(event["user_id"]),
+        "event_date": event["occurred_at"][:10],
+    }
+
+# Stateful — requires seeing multiple events, streaming adds complexity
+def compute_session(events: list[dict]) -> dict:
+    # Need all events for a user within a time window
+    # Streaming requires stateful operators + watermarking
+    session_start = min(e["occurred_at"] for e in events)
+    session_end   = max(e["occurred_at"] for e in events)
+    return {
+        "session_duration_seconds": (session_end - session_start).seconds,
+        "event_count": len(events),
+        "pages_visited": len({e["page"] for e in events}),
+    }
+```
+
+Stateful streaming (sessions, windowed aggregations, joins across streams) is significantly harder to operate correctly than the equivalent batch job. If your stateful computation can tolerate 15-minute lag, do it in batch.
+
+### 3. Is the data bounded or unbounded?
+
+```
+Bounded data   → has a defined start and end → Batch
+Unbounded data → continuously arrives        → Streaming (or micro-batch)
+```
+
+Even with unbounded data, ask: **can I micro-batch it?** A Spark Structured Streaming job with `processingTime="5 minutes"` trigger gives you batch semantics with streaming infrastructure — the sweet spot for most use cases.
+
+### 4. What happens when it breaks?
+
+This is the question teams skip in the excitement of building something new.
+
+**Batch failure recovery:**
+```bash
+# Re-run yesterday's job with the correct date partition
+spark-submit batch_job.py --date 2026-04-30
+
+# Or replay a range
+for date in 2026-04-28 2026-04-29 2026-04-30; do
+    spark-submit batch_job.py --date $date
+done
+```
+
+Simple. Idempotent. Auditable.
+
+**Streaming failure recovery:**
+```python
+# Requires checkpoints, offset management, state store recovery
+# If checkpoint is corrupted → manual offset reset
+# If state store is corrupted → rebuild from scratch (hours)
+# If you deployed a bug → replay from Kafka (only if retention allows)
+# If Kafka retention expired → data is gone
+
+# The recovery runbook is 4 pages long
+```
+
+If your team doesn't have on-call engineers comfortable with Kafka offset management and Spark checkpoint recovery, streaming failure recovery becomes a 2am incident. Be honest about your team's operational maturity.
+
+### 5. What is the total cost?
+
+```python
+# Rough cost comparison for processing 10M events/day
+
+batch_cost = {
+    "compute": "2-hour Spark job, 10 nodes, twice daily",
+    "storage": "S3 standard",
+    "infrastructure": "No always-on brokers needed",
+    "engineering_hours": "Low — simple to debug and maintain",
+}
+
+streaming_cost = {
+    "compute": "Always-on Spark Streaming cluster, 10 nodes, 24/7",
+    "storage": "S3 + Kafka storage (7-day retention)",
+    "infrastructure": "3-broker Kafka cluster, always running",
+    "engineering_hours": "High — Kafka ops, checkpoint management, tuning",
+}
+
+# Streaming is typically 3-5x more expensive for the same throughput
+# The latency improvement must be worth that multiplier
+```
+
+## My Decision Framework
+
+```
+Does the use case require < 5 minute latency?
+    │
+    ├── NO  → Use Batch
+    │         Schedule with Airflow/Dagster
+    │         Optimize for throughput and simplicity
+    │
+    └── YES → Does it require < 1 minute latency?
+                  │
+                  ├── NO  → Use Micro-batch Streaming
+                  │         Spark Structured Streaming
+                  │         trigger(processingTime="2 minutes")
+                  │         Simple checkpointing, batch-like semantics
+                  │
+                  └── YES → Does it require stateful computation?
+                                │
+                                ├── NO  → Simple Streaming
+                                │        Kafka → Spark → Delta
+                                │        Stateless transforms only
+                                │
+                                └── YES → Full Streaming
+                                          Kafka + Spark Stateful Ops
+                                          Watermarking, state stores
+                                          Highest complexity and cost
+```
+
+## When Batch Wins
+
+### Use Case 1: Historical Backfills
+
+No discussion needed. Always batch.
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, to_date
+
+def run_backfill(start_date: str, end_date: str):
+    spark = SparkSession.builder.appName("backfill").getOrCreate()
+
+    df = (
+        spark.read.format("delta")
+        .load("s3://datalake/bronze/events")
+        .filter(
+            (col("event_date") >= start_date) &
+            (col("event_date") <= end_date)
+        )
+    )
+
+    silver_df = transform_to_silver(df)
+
+    (
+        silver_df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("replaceWhere", f"event_date >= '{start_date}' AND event_date <= '{end_date}'")
+        .save("s3://datalake/silver/events")
+    )
+
+    print(f"Backfill complete: {start_date} → {end_date}, rows={silver_df.count():,}")
+```
+
+### Use Case 2: Complex Aggregations with No Latency SLA
+
+Revenue reconciliation, monthly cohort analysis, finance reports — none of these need to be streaming.
+
+```python
+def compute_monthly_cohorts(spark, month: str):
+    """
+    Month-over-month retention cohort.
+    Needs full month of data to be correct — inherently batch.
+    """
+    return spark.sql(f"""
+        WITH cohort_base AS (
+            SELECT
+                user_id_hashed,
+                DATE_TRUNC('month', MIN(occurred_at)) AS cohort_month
+            FROM silver.events
+            WHERE event_type = 'signup_completed'
+            GROUP BY user_id_hashed
+        ),
+        activity AS (
+            SELECT DISTINCT
+                user_id_hashed,
+                DATE_TRUNC('month', occurred_at) AS active_month
+            FROM silver.events
+        )
+        SELECT
+            cb.cohort_month,
+            a.active_month,
+            MONTHS_BETWEEN(a.active_month, cb.cohort_month) AS months_since_cohort,
+            COUNT(DISTINCT a.user_id_hashed) AS retained_users,
+            COUNT(DISTINCT cb.user_id_hashed) AS cohort_size,
+            ROUND(
+                COUNT(DISTINCT a.user_id_hashed) * 100.0
+                / COUNT(DISTINCT cb.user_id_hashed), 2
+            ) AS retention_rate_pct
+        FROM cohort_base cb
+        LEFT JOIN activity a USING (user_id_hashed)
+        WHERE cb.cohort_month = '{month}'
+        GROUP BY 1, 2, 3
+        ORDER BY 1, 2
+    """)
+```
+
+### Use Case 3: ML Feature Engineering
+
+Training datasets are always batch. Feature pipelines that serve online predictions are a different story — but the feature *engineering* (computing features from raw events) is almost always batch.
+
+```python
+def build_user_features(spark, snapshot_date: str):
+    """
+    Point-in-time correct feature snapshot for ML training.
+    Must be batch — you're computing over historical windows.
+    """
+    return spark.sql(f"""
+        SELECT
+            user_id_hashed,
+            -- Recency
+            DATEDIFF('{snapshot_date}', MAX(occurred_at)) AS days_since_last_event,
+            -- Frequency
+            COUNT(*) AS total_events_30d,
+            COUNT(DISTINCT DATE(occurred_at)) AS active_days_30d,
+            -- Monetary
+            SUM(CAST(properties['amount'] AS DOUBLE)) AS total_spend_30d,
+            AVG(CAST(properties['amount'] AS DOUBLE)) AS avg_order_value_30d,
+            -- Engagement
+            COUNT(DISTINCT session_id) AS sessions_30d,
+            COUNT(DISTINCT properties['page']) AS unique_pages_30d
+        FROM silver.events
+        WHERE occurred_at >= DATE_SUB('{snapshot_date}', 30)
+          AND occurred_at <  '{snapshot_date}'
+          AND dq_passed = true
+        GROUP BY user_id_hashed
+    """)
+```
+
+## When Streaming Wins
+
+### Use Case 1: Fraud Detection
+
+Fraud patterns are time-sensitive. A stolen card used 5 times in 3 minutes needs a real-time signal — a batch job running in an hour is useless.
+
+```python
+from pyspark.sql.functions import window, count, col
+
+def detect_velocity_fraud(stream_df):
+    """
+    Flag users with > 5 transactions in a 3-minute window.
+    Only makes sense as streaming — batch misses the window.
+    """
+    return (
+        stream_df
+        .filter(col("event_type") == "transaction_attempted")
+        .withWatermark("occurred_at", "5 minutes")
+        .groupBy(
+            col("user_id_hashed"),
+            window(col("occurred_at"), "3 minutes", "1 minute")
+        )
+        .agg(count("*").alias("tx_count"))
+        .filter(col("tx_count") > 5)
+        .select(
+            col("user_id_hashed"),
+            col("window.start").alias("window_start"),
+            col("window.end").alias("window_end"),
+            col("tx_count"),
+        )
+    )
+```
+
+### Use Case 2: Real-Time Personalization
+
+Recommendation engines that need to react to what a user just did — not what they did yesterday.
+
+```python
+def update_user_context(stream_df, context_store):
+    """
+    Maintain a live user context that downstream services query.
+    Batch would always serve stale state.
+    """
+    def process_batch(batch_df, batch_id):
+        recent_events = (
+            batch_df
+            .groupBy("user_id_hashed")
+            .agg(
+                collect_list(
+                    struct("event_type", "occurred_at", "properties")
+                ).alias("recent_events")
+            )
+        )
+
+        # Upsert into Redis / DynamoDB for low-latency serving
+        recent_events.foreach(lambda row: context_store.upsert(
+            key=row["user_id_hashed"],
+            value=row["recent_events"][-10:]  # Last 10 events
+        ))
+
+    return (
+        stream_df
+        .writeStream
+        .foreachBatch(process_batch)
+        .trigger(processingTime="30 seconds")
+        .start()
+    )
+```
+
+### Use Case 3: Operational Alerting
+
+Monitoring infrastructure, detecting anomalies, triggering downstream actions — these need to react in seconds, not hours.
+
+```python
+def monitor_error_rate(stream_df):
+    """
+    Alert if error rate exceeds 1% in any 1-minute window.
+    A batch job running hourly would miss a 5-minute outage entirely.
+    """
+    return (
+        stream_df
+        .withWatermark("occurred_at", "2 minutes")
+        .groupBy(
+            col("platform"),
+            window(col("occurred_at"), "1 minute")
+        )
+        .agg(
+            count("*").alias("total_events"),
+            count(when(col("event_type") == "error", 1)).alias("error_count")
+        )
+        .withColumn("error_rate_pct",
+            col("error_count") * 100.0 / col("total_events")
+        )
+        .filter(col("error_rate_pct") > 1.0)
+        .writeStream
+        .foreachBatch(lambda df, _: df.foreach(
+            lambda row: trigger_alert(
+                f"Error rate spike on {row['platform']}: "
+                f"{row['error_rate_pct']:.1f}% in window {row['window']}"
+            )
+        ))
+        .start()
+    )
+```
+
+## The Hybrid Architecture (What I Actually Build)
+
+In practice, most mature data platforms use both — batch for correctness and history, streaming for freshness and operational signals.
+
+```
+                    ┌─────────────────────────────────┐
+                    │         Apache Kafka             │
+                    │      (Unbounded Event Log)       │
+                    └──────────┬──────────────────────┘
+                               │
+               ┌───────────────┴────────────────┐
+               │                                │
+               ▼                                ▼
+    ┌─────────────────────┐         ┌─────────────────────┐
+    │   Spark Streaming   │         │    Spark Batch       │
+    │  (Bronze → Silver)  │         │  (Silver → Gold)     │
+    │   trigger: 1 min    │         │  schedule: hourly    │
+    └──────────┬──────────┘         └──────────┬──────────┘
+               │                               │
+               ▼                               ▼
+    ┌─────────────────────┐         ┌─────────────────────┐
+    │   Operational DB    │         │     Delta Lake       │
+    │ Redis / DynamoDB    │         │   (Gold Tables)      │
+    │ (Fraud, Alerts)     │         │  (BI / Analytics)    │
+    └─────────────────────┘         └─────────────────────┘
+```
+
+The streaming layer handles freshness and operational decisions. The batch layer handles correctness and analytical depth. They consume from the same Kafka topics and write to the same Delta Lake — different consumers, different SLAs, different cost profiles.
+
+## Real Conversation I've Had
+
+> **Stakeholder:** "Can we make this dashboard real-time?"
+>
+> **Me:** "It currently refreshes every hour. What decision would you make differently if it refreshed every 5 minutes?"
+>
+> **Stakeholder:** "... I'd see problems sooner."
+>
+> **Me:** "Which problems? Let's add alerts for those specific thresholds. That's cheaper than rebuilding the pipeline."
+
+Ninety percent of "we need real-time" requests are solved by better alerting on the existing batch pipeline. The other ten percent genuinely need streaming — and for those, it's absolutely worth building.
+
+## Production Checklist
+
+✅ **Before choosing streaming:**
+- Latency requirement is < 5 minutes and verified with stakeholders
+- Team has Kafka operational experience
+- Recovery runbook exists for checkpoint corruption
+- Cost comparison done (streaming is 3-5x more expensive)
+- Micro-batch was evaluated and rejected with a reason
+
+✅ **If using batch:**
+- Jobs are idempotent (safe to re-run)
+- Partitioned by date for efficient backfills
+- `replaceWhere` instead of full overwrites on Delta
+- SLA defined and monitored (not just "runs nightly")
+
+✅ **If using streaming:**
+- Checkpoint location is durable (S3, not local disk)
+- Watermark duration matches your late-arrival SLA
+- DLQ configured for malformed messages
+- Consumer lag alert set at 2x normal
+- Runbook for offset reset and checkpoint recovery
+
+✅ **If using both (hybrid):**
+- Clear ownership of which layer owns which SLA
+- Streaming for operational signals, batch for analytical correctness
+- Same Kafka topics consumed by both — no duplicate ingestion
+
+## Common Pitfalls
+
+❌ **Choosing streaming because it sounds more impressive** - Batch jobs that run reliably are worth more than streaming pipelines that need babysitting  
+❌ **No checkpoint backup** - A corrupted checkpoint means replaying from Kafka; if retention expired, data is gone  
+❌ **Watermark set too short** - Mobile events routinely arrive 1-2 hours late; a 10-minute watermark silently drops them  
+❌ **Stateful streaming without RocksDB** - Default in-memory state store causes OOM at scale; switch early  
+❌ **Streaming everything into a database** - High-frequency micro-writes destroy database performance; buffer into Delta and serve from there  
+❌ **No backfill strategy** - Streaming pipelines start from "now"; you need a batch backfill for historical data  
+
+## Key Takeaways
+
+1. **Streaming solves latency, not reliability** - Fix your batch pipeline's reliability before adding streaming complexity
+2. **Micro-batch is the sweet spot** - Most "streaming" use cases are satisfied by Spark triggers of 1–5 minutes
+3. **Ask the latency question honestly** - "Real-time" usually means "faster than 6 hours" not "under 30 seconds"
+4. **Hybrid is the mature architecture** - Streaming for operational signals, batch for analytical correctness
+5. **Operational cost is real** - Streaming requires Kafka ops, checkpoint management, and on-call maturity
+6. **Design for recovery first** - The question is not "how do we build it" but "how do we fix it at 2am"
+
+The best pipeline is the one your team can operate, debug, and recover from at 2am without a PhD in distributed systems.
+
+---
+
+**Related:** [Building Fault-Tolerant Kafka Pipelines](/blog/fault-tolerant-kafka) | [End-to-End Data Pipeline Case Study](/blog/end-to-end-data-pipeline-case-study) | [Data Quality & Observability in Data Pipelines](/blog/data-quality-observability-pipelines)
