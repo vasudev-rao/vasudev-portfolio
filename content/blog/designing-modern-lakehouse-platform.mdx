@@ -1,0 +1,901 @@
+---
+title: "Designing a Modern Lakehouse Data Platform: End-to-End Architecture"
+date: "2026-05-01"
+excerpt: "A practical guide to designing a production-grade lakehouse data platform from scratch — covering storage architecture, ingestion patterns, transformation layers, serving strategies, and the decisions that actually matter in the real world."
+tags: ["Data Engineering", "Lakehouse", "Delta Lake", "Databricks", "Architecture", "Medallion Architecture", "Apache Iceberg"]
+readTime: "20 min read"
+---
+
+# Designing a Modern Lakehouse Data Platform: End-to-End Architecture
+
+Three years ago, my team inherited a data platform that was half data warehouse, half data lake, and fully broken. Redshift for reporting, S3 for raw dumps, Glue for ETL, five different orchestration tools, no data contracts, no lineage, and a 6-hour SLA that was missed more often than it was met.
+
+We rebuilt it from scratch as a modern lakehouse. Today it processes 50TB of data daily, serves 200+ dashboards, powers three ML models in production, and runs with a team of four engineers.
+
+This is the architecture we arrived at — and more importantly, the decisions behind it.
+
+## What Is a Lakehouse (And Why It Matters)
+
+A lakehouse combines the low-cost flexible storage of a data lake with the reliability, ACID transactions, and performance of a data warehouse — without duplicating data between two separate systems.
+
+| System | Strengths | Weaknesses |
+|--------|-----------|------------|
+| **Data Warehouse** | Fast queries, ACID, governance | Expensive, rigid schema, no ML support |
+| **Data Lake** | Cheap, flexible, supports ML | No transactions, poor query performance, no governance |
+| **Lakehouse** | ACID on object storage, cheap, flexible, ML-ready | Newer tooling, requires careful design |
+
+The lakehouse isn't a product — it's an architectural pattern. The implementation is Delta Lake, Apache Iceberg, or Apache Hudi sitting on top of S3 or GCS, giving you transactional guarantees on cheap object storage.
+
+We chose **Delta Lake on S3** with Databricks as the compute layer. The reasons:
+
+- Delta's transaction log gives us time travel, schema enforcement, and ACID for free
+- Databricks Unity Catalog gives us column-level lineage and access control
+- The ecosystem around Delta (dbt, Spark, Flink) is mature enough for production
+
+## Platform Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        DATA SOURCES                             │
+│  Transactional DBs │ SaaS APIs │ Event Streams │ File Uploads   │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      INGESTION LAYER                            │
+│         Kafka (Streaming) │ Fivetran (SaaS) │ Airbyte (DBs)    │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     STORAGE LAYER (S3)                          │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐ │
+│  │   BRONZE    │  │   SILVER    │  │          GOLD           │ │
+│  │  Raw Data   │  │  Cleaned &  │  │   Business Aggregates   │ │
+│  │  Immutable  │  │  Conformed  │  │   Domain-Specific       │ │
+│  └─────────────┘  └─────────────┘  └─────────────────────────┘ │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    TRANSFORMATION LAYER                         │
+│            Spark (Heavy) │ dbt (SQL) │ Python (ML Prep)        │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                      SERVING LAYER                              │
+│   Databricks SQL │ Redshift Spectrum │ REST APIs │ Feature Store│
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     CONSUMPTION LAYER                           │
+│        Tableau │ Looker │ Jupyter │ ML Models │ microservices   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Every layer has a single responsibility. The ingestion layer doesn't transform. The transformation layer doesn't serve. This separation is what makes the platform maintainable at scale.
+
+## Layer 1: Ingestion Architecture
+
+### Choosing the Right Ingestion Pattern
+
+Not all data sources are the same. I use three ingestion patterns depending on the source:
+
+| Pattern | Use Case | Tooling | Latency |
+|---------|----------|---------|---------|
+| **Change Data Capture** | Transactional databases (Postgres, MySQL) | Debezium → Kafka | Seconds |
+| **API Polling** | SaaS tools (Salesforce, HubSpot, Stripe) | Fivetran / Airbyte | 15–60 min |
+| **Event Streaming** | Application events, clickstreams | Kafka producers | Sub-second |
+| **Bulk Load** | Historical backfills, file uploads | Spark batch | Hours |
+
+The mistake most teams make is trying to standardize on one ingestion pattern. You can't. A Postgres database and a Kafka topic have fundamentally different characteristics — forcing them through the same pipeline creates unnecessary complexity.
+
+### CDC with Debezium
+
+For transactional databases, Change Data Capture is far superior to scheduled full or incremental loads. You capture every insert, update, and delete as it happens:
+
+```python
+# Debezium connector config for Postgres CDC
+debezium_config = {
+    "name": "postgres-cdc-connector",
+    "config": {
+        "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+        "database.hostname": "prod-postgres.internal",
+        "database.port": "5432",
+        "database.user": "debezium_user",
+        "database.password": "${DB_PASSWORD}",
+        "database.dbname": "production",
+        "database.server.name": "prod",
+
+        # Capture all tables in the public schema
+        "schema.include.list": "public",
+        "table.include.list": "public.users,public.orders,public.payments",
+
+        # Use pgoutput plugin (Postgres 10+)
+        "plugin.name": "pgoutput",
+        "publication.name": "debezium_publication",
+
+        # Include transaction metadata
+        "provide.transaction.metadata": "true",
+
+        # Snapshot existing data on first run
+        "snapshot.mode": "initial",
+
+        # Kafka topic naming: prod.public.users
+        "topic.prefix": "prod",
+    }
+}
+```
+
+Each CDC event lands in Kafka with an operation type (`c` = create, `u` = update, `d` = delete) and the full before/after state. Your Bronze layer captures this raw, and Silver applies the merge logic.
+
+### Handling CDC in Bronze → Silver
+
+```python
+from pyspark.sql.functions import col, from_json, when
+from pyspark.sql.types import StructType, StructField, StringType, LongType
+from delta.tables import DeltaTable
+
+CDC_SCHEMA = StructType([
+    StructField("op",     StringType(), False),  # c, u, d, r (read/snapshot)
+    StructField("ts_ms",  LongType(),   False),  # Event timestamp
+    StructField("before", StringType(), True),   # State before change
+    StructField("after",  StringType(), True),   # State after change
+    StructField("source", StringType(), False),  # Source metadata
+])
+
+def apply_cdc_to_silver(
+    bronze_df,
+    silver_table_path: str,
+    merge_key: str
+):
+    """
+    Apply CDC operations to Silver using Delta MERGE.
+    Handles inserts, updates, and deletes correctly.
+    """
+    silver_table = DeltaTable.forPath(spark, silver_table_path)
+
+    def process_cdc_batch(batch_df, batch_id):
+        parsed = (
+            batch_df
+            .withColumn("cdc", from_json(col("raw_payload"), CDC_SCHEMA))
+            .select(
+                col("cdc.op").alias("operation"),
+                col("cdc.ts_ms").alias("cdc_timestamp"),
+                from_json(col("cdc.after"), get_table_schema()).alias("after_state"),
+            )
+        )
+
+        # Deduplicate: keep latest operation per key within batch
+        from pyspark.sql.window import Window
+        from pyspark.sql.functions import row_number, desc
+
+        window = Window.partitionBy(f"after_state.{merge_key}").orderBy(
+            desc("cdc_timestamp")
+        )
+        deduped = (
+            parsed
+            .withColumn("rn", row_number().over(window))
+            .filter(col("rn") == 1)
+            .drop("rn")
+        )
+
+        # Separate deletes from upserts
+        deletes = deduped.filter(col("operation") == "d")
+        upserts = deduped.filter(col("operation").isin("c", "u", "r"))
+
+        # Apply MERGE for upserts
+        if upserts.count() > 0:
+            (
+                silver_table.alias("target")
+                .merge(
+                    upserts.select("after_state.*").alias("source"),
+                    f"target.{merge_key} = source.{merge_key}"
+                )
+                .whenMatchedUpdateAll()
+                .whenNotMatchedInsertAll()
+                .execute()
+            )
+
+        # Apply soft deletes
+        if deletes.count() > 0:
+            delete_keys = [row[merge_key] for row in deletes.select(
+                f"after_state.{merge_key}"
+            ).collect()]
+
+            (
+                silver_table.update(
+                    condition=col(merge_key).isin(delete_keys),
+                    set={"is_deleted": "true", "deleted_at": "current_timestamp()"}
+                )
+            )
+
+    return process_cdc_batch
+```
+
+## Layer 2: Storage Architecture
+
+### The Medallion Architecture in Practice
+
+Every team says they follow Medallion. Few implement it correctly. Here's what each layer actually means in production:
+
+**Bronze — The Immutable Archive**
+
+```python
+# Bronze is append-only. NEVER update or delete Bronze.
+# It is your replay source. Treat it like write-once storage.
+
+bronze_write_config = {
+    "format": "delta",
+    "mode": "append",
+    "partitionBy": ["source_system", "ingestion_date"],
+    "options": {
+        "mergeSchema": "false",        # Reject schema changes — surface them early
+        "checkpointLocation": "...",
+        "delta.logRetentionDuration": "interval 365 days",  # 1 year retention
+    }
+}
+
+# What Bronze stores per record:
+bronze_metadata_columns = [
+    "raw_payload",          # Exact bytes received from source
+    "source_system",        # "kafka", "postgres_cdc", "fivetran_salesforce"
+    "source_topic",         # Kafka topic or table name
+    "ingestion_timestamp",  # When WE received it (not when it happened)
+    "pipeline_version",     # Which version of pipeline wrote this
+    "schema_version",       # Avro/JSON schema version
+    "checksum",             # MD5 of raw_payload for integrity verification
+]
+```
+
+**Silver — The Conformed Layer**
+
+```python
+# Silver is the single source of truth for cleaned, typed, deduplicated data.
+# Multiple Gold tables read from Silver. Never duplicate Silver logic.
+
+silver_design_principles = {
+    "schema": "enforced and versioned — no implicit casts",
+    "deduplication": "event_id based, within watermark window",
+    "pii": "masked or tokenized before writing — never raw PII in Silver",
+    "partitioning": "by event_date and high-cardinality filter columns",
+    "history": "SCD Type 2 for slowly changing dimensions",
+    "dq_flags": "row-level dq_passed, dq_failure_reason columns on every table",
+}
+
+# Silver partition strategy
+silver_partition_config = {
+    "events":       ["event_date", "platform"],
+    "users":        ["signup_date"],               # SCD2, partition by effective date
+    "transactions": ["transaction_date", "status"],
+    "sessions":     ["session_date"],
+}
+```
+
+**Gold — Domain-Oriented Products**
+
+```python
+# Gold tables are owned by business domains, not data engineering.
+# Each Gold table has a named owner and SLA.
+
+gold_table_registry = {
+    "gold.dau_by_platform": {
+        "owner":       "product_analytics",
+        "sla_minutes": 60,
+        "consumers":   ["tableau_product_dashboard", "growth_api"],
+        "freshness":   "hourly_batch",
+        "description": "Daily active users segmented by platform and feature",
+    },
+    "gold.revenue_daily": {
+        "owner":       "finance",
+        "sla_minutes": 30,
+        "consumers":   ["looker_finance", "reconciliation_job"],
+        "freshness":   "every_30_min",
+        "description": "Net revenue after refunds, by currency and platform",
+    },
+    "gold.ml_user_features": {
+        "owner":       "ml_platform",
+        "sla_minutes": 120,
+        "consumers":   ["churn_model", "ltv_model"],
+        "freshness":   "daily_batch",
+        "description": "Point-in-time correct feature snapshot for ML training",
+    },
+}
+```
+
+### Delta Lake Configuration That Actually Matters
+
+```python
+# Table creation with production-grade properties
+spark.sql("""
+    CREATE TABLE IF NOT EXISTS silver.events (
+        event_id            STRING        NOT NULL,
+        user_id_hashed      STRING        NOT NULL,
+        session_id          STRING,
+        event_type          STRING        NOT NULL,
+        platform            STRING        NOT NULL,
+        occurred_at         TIMESTAMP     NOT NULL,
+        ingested_at         TIMESTAMP     NOT NULL,
+        event_date          DATE          NOT NULL,
+        properties          MAP<STRING, STRING>,
+        ingestion_lag_secs  BIGINT,
+        is_late_arrival     BOOLEAN,
+        dq_passed           BOOLEAN       NOT NULL,
+        dq_failure_reason   STRING,
+        pipeline_version    STRING
+    )
+    USING DELTA
+    PARTITIONED BY (event_date, platform)
+    TBLPROPERTIES (
+        'delta.enableChangeDataFeed'            = 'true',
+        'delta.autoOptimize.optimizeWrite'      = 'true',
+        'delta.autoOptimize.autoCompact'        = 'true',
+        'delta.dataSkippingNumIndexedCols'      = '5',
+        'delta.logRetentionDuration'            = 'interval 30 days',
+        'delta.deletedFileRetentionDuration'    = 'interval 7 days',
+        'quality.owner'                         = 'data_platform',
+        'quality.sla_minutes'                   = '15'
+    )
+""")
+```
+
+### Z-Ordering Strategy
+
+Z-ordering is not magic — it works best on columns you filter on frequently, with high cardinality, in tables larger than a few GB.
+
+```sql
+-- Run as part of nightly maintenance job
+-- Order matters: most selective filter column first
+
+-- Events table: users filter by date range + event type + platform
+OPTIMIZE silver.events
+ZORDER BY (event_date, event_type, platform);
+
+-- Transactions: finance queries by date + status + currency
+OPTIMIZE silver.transactions
+ZORDER BY (transaction_date, status, currency);
+
+-- After OPTIMIZE, vacuum old files
+VACUUM silver.events RETAIN 168 HOURS;    -- 7 days
+VACUUM silver.transactions RETAIN 168 HOURS;
+```
+
+## Layer 3: Transformation Architecture
+
+### Spark for Heavy Lifting, dbt for SQL Logic
+
+One of the best decisions we made: use Spark for data movement and heavy transformations, use dbt for business logic SQL.
+
+```
+Spark responsibilities:
+  ✓ Reading from Kafka
+  ✓ Schema parsing and type casting
+  ✓ PII masking
+  ✓ Deduplication with watermarking
+  ✓ Writing to Delta with MERGE
+  ✓ Large-scale backfills
+
+dbt responsibilities:
+  ✓ Bronze → Silver SQL transformations (simple tables)
+  ✓ Silver → Gold aggregations
+  ✓ Business logic (revenue calculations, attribution)
+  ✓ Data tests (not_null, unique, accepted_values)
+  ✓ Documentation and lineage
+```
+
+**dbt model for Gold DAU:**
+
+```sql
+-- models/gold/dau_by_platform.sql
+{{ config(
+    materialized='incremental',
+    unique_key=['event_date', 'platform'],
+    incremental_strategy='merge',
+    partition_by={'field': 'event_date', 'data_type': 'date'},
+    cluster_by=['platform'],
+    tags=['gold', 'product', 'daily']
+) }}
+
+WITH base AS (
+    SELECT
+        event_date,
+        platform,
+        COUNT(DISTINCT user_id_hashed)                   AS dau,
+        COUNT(DISTINCT session_id)                       AS total_sessions,
+        COUNT(*)                                         AS total_events,
+        ROUND(COUNT(*) / COUNT(DISTINCT session_id), 2)  AS events_per_session,
+        SUM(CASE WHEN is_late_arrival THEN 1 ELSE 0 END) AS late_arrival_count,
+        SUM(CASE WHEN NOT dq_passed   THEN 1 ELSE 0 END) AS failed_dq_count,
+        CURRENT_TIMESTAMP()                              AS refreshed_at
+    FROM {{ ref('silver_events') }}
+    WHERE dq_passed = true
+    {% if is_incremental() %}
+        AND event_date >= DATE_SUB(CURRENT_DATE(), 3)    -- 3-day lookback for late arrivals
+    {% endif %}
+    GROUP BY event_date, platform
+)
+
+SELECT * FROM base
+```
+
+**dbt schema tests:**
+
+```yaml
+# models/gold/schema.yml
+version: 2
+
+models:
+  - name: dau_by_platform
+    description: "Daily active users by platform. Owned by Product Analytics."
+    columns:
+      - name: event_date
+        tests:
+          - not_null
+          - dbt_utils.recency:
+              datepart: day
+              field: event_date
+              interval: 1      # Fail if no data in last 1 day
+      - name: platform
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['WEB', 'IOS', 'ANDROID', 'BACKEND']
+      - name: dau
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: ">= 0"
+```
+
+### SCD Type 2 for Slowly Changing Dimensions
+
+User attributes change over time — subscription tier, location, segment. SCD Type 2 preserves history so you can do point-in-time correct analysis.
+
+```python
+from delta.tables import DeltaTable
+from pyspark.sql.functions import (
+    col, current_timestamp, lit, sha2, concat_ws
+)
+
+def apply_scd2(
+    source_df,
+    target_path: str,
+    business_key: str,
+    tracked_columns: list[str]
+):
+    """
+    Apply SCD Type 2 merge to a dimension table.
+    New records get is_current=True.
+    Changed records: old row gets is_current=False + valid_to set.
+    """
+    target = DeltaTable.forPath(spark, target_path)
+
+    # Compute hash of tracked columns to detect changes
+    hash_expr = sha2(concat_ws("|", *[col(c) for c in tracked_columns]), 256)
+    source_with_hash = source_df.withColumn("row_hash", hash_expr)
+
+    (
+        target.alias("target")
+        .merge(
+            source_with_hash.alias("source"),
+            f"target.{business_key} = source.{business_key} AND target.is_current = true"
+        )
+        # Row exists and hasn't changed — do nothing
+        .whenMatchedUpdate(
+            condition="target.row_hash = source.row_hash",
+            set={"last_seen_at": "current_timestamp()"}
+        )
+        # Row exists but has changed — expire the old row
+        .whenMatchedUpdate(
+            condition="target.row_hash != source.row_hash",
+            set={
+                "is_current": "false",
+                "valid_to":   "current_timestamp()"
+            }
+        )
+        # New row — insert as current
+        .whenNotMatchedInsert(
+            values={
+                **{c: f"source.{c}" for c in source_df.columns},
+                "is_current":  "true",
+                "valid_from":  "current_timestamp()",
+                "valid_to":    "null",
+                "row_hash":    "source.row_hash",
+            }
+        )
+        .execute()
+    )
+
+    # Insert new versions for changed rows
+    changed_records = (
+        source_with_hash.alias("source")
+        .join(
+            target.toDF().filter("is_current = false").alias("target"),
+            on=business_key,
+            how="inner"
+        )
+        .select("source.*")
+        .withColumn("is_current", lit(True))
+        .withColumn("valid_from", current_timestamp())
+        .withColumn("valid_to",   lit(None))
+    )
+
+    if changed_records.count() > 0:
+        changed_records.write.format("delta").mode("append").save(target_path)
+```
+
+## Layer 4: Orchestration
+
+### Airflow DAG Structure
+
+We organize DAGs by data domain and dependency tier, not by schedule:
+
+```python
+from airflow import DAG
+from airflow.providers.databricks.operators.databricks import DatabricksRunNowOperator
+from airflow.sensors.external_task import ExternalTaskSensor
+from datetime import datetime, timedelta
+
+default_args = {
+    "owner":            "data-platform",
+    "retries":          2,
+    "retry_delay":      timedelta(minutes=5),
+    "email_on_failure": True,
+    "email":            ["data-oncall@company.com"],
+}
+
+with DAG(
+    dag_id="silver_to_gold_product",
+    default_args=default_args,
+    schedule_interval="0 * * * *",    # Hourly
+    start_date=datetime(2026, 1, 1),
+    catchup=False,
+    tags=["gold", "product"],
+) as dag:
+
+    # Wait for Silver to be fresh before running Gold
+    wait_for_silver = ExternalTaskSensor(
+        task_id="wait_for_silver_events",
+        external_dag_id="bronze_to_silver",
+        external_task_id="silver_events_complete",
+        timeout=1800,       # 30 min timeout
+        poke_interval=60,
+    )
+
+    run_dau = DatabricksRunNowOperator(
+        task_id="run_dau_by_platform",
+        databricks_conn_id="databricks_prod",
+        job_id=101,
+        notebook_params={"run_date": "{{ ds }}"},
+    )
+
+    run_revenue = DatabricksRunNowOperator(
+        task_id="run_revenue_daily",
+        databricks_conn_id="databricks_prod",
+        job_id=102,
+        notebook_params={"run_date": "{{ ds }}"},
+    )
+
+    run_dq_checks = DatabricksRunNowOperator(
+        task_id="run_gold_dq_checks",
+        databricks_conn_id="databricks_prod",
+        job_id=103,
+    )
+
+    wait_for_silver >> [run_dau, run_revenue] >> run_dq_checks
+```
+
+### Idempotent Jobs Are Non-Negotiable
+
+Every job must be safely re-runnable. Airflow retries happen. On-call engineers re-run failed jobs. If a job isn't idempotent, you'll eventually have corrupt data.
+
+```python
+def run_idempotent_gold_job(run_date: str, table_path: str):
+    """
+    Always use replaceWhere for Gold writes.
+    Re-running for the same date produces identical results.
+    """
+    df = compute_gold_metrics(run_date)
+
+    (
+        df.write
+        .format("delta")
+        .mode("overwrite")
+        .option(
+            "replaceWhere",
+            f"event_date = '{run_date}'"    # Only replace this partition
+        )
+        .save(table_path)
+    )
+
+    # Log run metadata for audit trail
+    log_run_metadata(
+        table=table_path,
+        run_date=run_date,
+        rows_written=df.count(),
+        run_by="airflow",
+        idempotency_key=f"{table_path}:{run_date}"
+    )
+```
+
+## Layer 5: Governance and Catalog
+
+### Unity Catalog for Access Control
+
+```python
+# Unity Catalog setup — column-level security for PII
+
+spark.sql("""
+    -- Create a masked view for analysts who shouldn't see raw emails
+    CREATE OR REPLACE VIEW catalog.silver_masked.users AS
+    SELECT
+        user_id_hashed,
+        subscription_tier,
+        signup_date,
+        country,
+        -- Mask email: show domain only
+        CONCAT('****@', SPLIT(email, '@')[1]) AS email_masked,
+        -- Mask phone: show last 4 digits only
+        CONCAT('***-***-', RIGHT(phone, 4))   AS phone_masked
+    FROM catalog.silver.users;
+
+    -- Grant analysts access to masked view only
+    GRANT SELECT ON VIEW catalog.silver_masked.users
+    TO `analysts@company.com`;
+
+    -- Data engineers get full access
+    GRANT SELECT ON TABLE catalog.silver.users
+    TO `data-engineering@company.com`;
+""")
+```
+
+### Data Contracts
+
+Every upstream team that writes to our platform signs a data contract — a schema + SLA agreement that protects the platform from unexpected changes:
+
+```yaml
+# contracts/events_v2.yaml
+contract:
+  name: user_interaction_events
+  version: "2.0"
+  owner: platform_team
+  effective_date: "2026-01-01"
+
+  schema:
+    - name: event_id
+      type: string
+      nullable: false
+      description: "UUID v4. Globally unique per event."
+    - name: user_id
+      type: string
+      nullable: false
+      description: "Internal user identifier."
+    - name: event_type
+      type: string
+      nullable: false
+      allowed_values: [page_view, click, form_submit, purchase, error]
+    - name: occurred_at
+      type: timestamp
+      nullable: false
+      description: "Client-side event time in UTC."
+    - name: platform
+      type: string
+      nullable: false
+      allowed_values: [WEB, IOS, ANDROID, BACKEND]
+
+  sla:
+    max_delay_seconds: 300
+    min_daily_volume: 500000
+    max_null_rate_pct: 0.1
+
+  breaking_change_policy:
+    notice_days: 14
+    approval_required_from: [data-platform-team]
+    migration_support: true
+```
+
+## Layer 6: Cost Governance
+
+A lakehouse can get expensive fast if you're not careful. Here's how we keep costs under control:
+
+### Storage Tiering
+
+```python
+# Lifecycle policy for S3 storage tiering
+s3_lifecycle_policy = {
+    "Rules": [
+        {
+            "Id": "bronze-tiering",
+            "Filter": {"Prefix": "bronze/"},
+            "Status": "Enabled",
+            "Transitions": [
+                # Move to IA after 30 days
+                {"Days": 30,  "StorageClass": "STANDARD_IA"},
+                # Move to Glacier after 90 days
+                {"Days": 90,  "StorageClass": "GLACIER"},
+                # Delete after 365 days (adjust per retention policy)
+                {"Days": 365, "StorageClass": "DEEP_ARCHIVE"},
+            ]
+        },
+        {
+            "Id": "silver-tiering",
+            "Filter": {"Prefix": "silver/"},
+            "Status": "Enabled",
+            "Transitions": [
+                {"Days": 90,  "StorageClass": "STANDARD_IA"},
+                {"Days": 365, "StorageClass": "GLACIER"},
+            ]
+        }
+    ]
+}
+```
+
+### Compute Cost Controls
+
+```python
+# Databricks cluster policies — prevent engineers from spinning up
+# oversized clusters for development work
+
+development_cluster_policy = {
+    "node_type_id": {
+        "type": "allowlist",
+        "values": ["m5d.xlarge", "m5d.2xlarge"],  # Max 8 vCPU for dev
+        "defaultValue": "m5d.xlarge"
+    },
+    "autotermination_minutes": {
+        "type": "fixed",
+        "value": 60    # Always terminate after 60 min idle
+    },
+    "num_workers": {
+        "type": "range",
+        "minValue": 1,
+        "maxValue": 4    # Max 4 workers for dev clusters
+    },
+    "spark_conf.spark.databricks.cluster.profile": {
+        "type": "fixed",
+        "value": "singleNode",
+        "hidden": False
+    }
+}
+
+# Production jobs use job clusters (spin up → run → terminate)
+# Never use all-purpose clusters for scheduled production jobs
+```
+
+### Query Cost Monitoring
+
+```python
+def monitor_query_costs(lookback_days: int = 7):
+    """
+    Identify expensive queries and their owners.
+    Run weekly and share with team leads.
+    """
+    expensive_queries = spark.sql(f"""
+        SELECT
+            user_name,
+            statement_type,
+            ROUND(total_duration_ms / 60000, 1)  AS duration_minutes,
+            rows_produced,
+            ROUND(bytes_scanned / 1e9, 2)        AS gb_scanned,
+            statement_text
+        FROM system.query_history
+        WHERE start_time >= CURRENT_TIMESTAMP - INTERVAL {lookback_days} DAYS
+          AND total_duration_ms > 300000          -- > 5 minutes
+        ORDER BY bytes_scanned DESC
+        LIMIT 50
+    """)
+
+    return expensive_queries
+```
+
+## Platform SLAs and Error Budget
+
+Define SLAs per layer before you go live. Without a defined SLA, there is no contract with stakeholders and no accountability for the platform team.
+
+| Layer | Availability SLA | Freshness SLA | Error Budget (monthly) |
+|-------|-----------------|---------------|------------------------|
+| Bronze | 99.9% | < 2 min lag | 43 min downtime |
+| Silver | 99.5% | < 15 min lag | 3.6 hrs downtime |
+| Gold | 99.0% | < 1 hr lag | 7.3 hrs downtime |
+| Serving | 99.9% | Real-time reads | 43 min downtime |
+
+```python
+def calculate_sla_compliance(table: str, layer: str, date: str) -> dict:
+    audit = spark.read.format("delta").load(AUDIT_TABLE)
+
+    stats = (
+        audit
+        .filter(f"table = '{table}' AND DATE(written_at) = '{date}'")
+        .agg(
+            count("*").alias("total_batches"),
+            sum(when(col("freshness_sla_met"), 1).otherwise(0)).alias("batches_on_time"),
+            avg("processing_lag_minutes").alias("avg_lag_minutes"),
+        )
+        .collect()[0]
+    )
+
+    compliance_pct = (stats["batches_on_time"] / stats["total_batches"]) * 100
+
+    return {
+        "table":          table,
+        "layer":          layer,
+        "date":           date,
+        "compliance_pct": round(compliance_pct, 2),
+        "avg_lag_minutes": round(stats["avg_lag_minutes"], 1),
+        "sla_met":        compliance_pct >= 99.0,
+    }
+```
+
+## What We Got Wrong (And Fixed)
+
+**Wrong: One giant Silver table for all event types.**
+We started with a single `silver.events` table. At 50TB it became unmanageable — schema conflicts between event types, query performance degraded, DQ checks were too coarse. We split it into domain-specific tables: `silver.user_events`, `silver.commerce_events`, `silver.system_events`. Query performance improved 10x.
+
+**Wrong: Gold tables owned by data engineering.**
+When data engineering owns Gold, every new metric becomes a ticket to the data team. We transitioned Gold ownership to domain teams (Product, Finance, Marketing) with data engineering providing the Silver foundation and tooling. Velocity tripled.
+
+**Wrong: No data contracts with upstream teams.**
+A mobile team renamed `user_id` to `userId` in a release. Our pipeline silently started writing nulls to Silver. We discovered it 3 days later. Data contracts with Schema Registry enforcement now make this impossible.
+
+**Wrong: Running OPTIMIZE too frequently.**
+We initially ran `OPTIMIZE` every hour. The compaction jobs were competing with streaming writes and causing write amplification. Running it nightly is the right frequency for most tables.
+
+## Production Checklist
+
+✅ **Storage:**
+- Bronze is append-only with 365-day retention
+- Silver has row-level DQ flags on every table
+- Gold tables have named owners and defined SLAs
+- Z-ordering configured for actual query patterns
+- OPTIMIZE + VACUUM on nightly schedule
+
+✅ **Ingestion:**
+- CDC for transactional databases (not scheduled full loads)
+- Schema Registry enforced for all Kafka topics
+- Data contracts signed with all upstream producers
+- DLQ configured for malformed records
+
+✅ **Transformation:**
+- All jobs are idempotent (use replaceWhere)
+- dbt tests run on every Gold refresh
+- SCD Type 2 for slowly changing dimensions
+- Backfill strategy documented for every pipeline
+
+✅ **Governance:**
+- Unity Catalog with column-level access control
+- PII masked before Silver — never raw PII in analytical layers
+- Query cost monitoring with weekly reports
+- Data lineage tracked end-to-end
+
+✅ **Operations:**
+- SLAs defined per layer before go-live
+- Freshness alerts configured per table
+- Runbook for every failure mode
+- Error budget tracked monthly
+
+## Common Pitfalls
+
+❌ **Skipping Bronze** - You will need to replay data; without Bronze you'll be sourcing from production databases under load  
+❌ **No data contracts** - Upstream teams will break your pipeline without knowing it  
+❌ **Gold owned by data engineering** - Creates a bottleneck; domain teams should own their Gold tables  
+❌ **All-purpose clusters for production jobs** - Use job clusters; they're cheaper and don't share resources  
+❌ **One Silver table for everything** - Split by domain early; retrofitting is painful at scale  
+❌ **OPTIMIZE too frequently** - Nightly is the right cadence for most tables; more often causes write amplification  
+❌ **Static partition pruning assumptions** - Always profile actual query patterns before Z-ordering  
+
+## Key Takeaways
+
+1. **Medallion is a pattern, not a product** - What matters is enforcing immutability in Bronze, conformity in Silver, and domain ownership in Gold
+2. **Data contracts prevent silent failures** - Schema Registry enforcement is the highest-leverage reliability investment
+3. **dbt for SQL logic, Spark for data movement** - Don't mix the two; each tool does one thing well
+4. **SLAs before go-live** - No SLA means no accountability; define them with stakeholders before the first table goes live
+5. **Cost governance is a feature** - Storage tiering, job cluster policies, and query monitoring should be built from day one
+6. **Idempotency is non-negotiable** - Every job must be safely re-runnable; Airflow will retry and engineers will re-run
+
+A lakehouse platform is not a one-time build — it's a product. The teams that succeed treat it that way: with versioned contracts, defined SLAs, domain ownership, and continuous investment in observability.
+
+---
+
+**Related:** [End-to-End Data Pipeline Case Study](/blog/end-to-end-data-pipeline-case-study) | [Data Quality & Observability in Data Pipelines](/blog/data-quality-observability-pipelines) | [Batch vs Streaming: How I Decide](/blog/batch-vs-streaming-how-i-decide)
